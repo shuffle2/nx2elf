@@ -102,8 +102,8 @@ struct NsoFile {
 		kData,
 		kNumSegment
 	};
-	static constexpr std::array<u8, 4> nso_magic{ 'N', 'S', 'O', '0' };
-	static constexpr std::array<u8, 4> mod_magic{ 'M', 'O', 'D', '0' };
+	static const std::array<u8, 4> nso_magic;
+	static const std::array<u8, 4> mod_magic;
 	struct SegmentHeader {
 		u32 file_offset; // maybe &1==compressed?
 		u32 mem_offset;
@@ -1058,6 +1058,8 @@ struct NsoFile {
 		u64 frame_size;
 	} eh_info{};
 };
+const std::array<u8, 4> NsoFile::nso_magic{ 'N', 'S', 'O', '0' };
+const std::array<u8, 4> NsoFile::mod_magic{ 'M', 'O', 'D', '0' };
 
 static bool NsoToElf(const fs::path& path, bool verbose = false) {
 	NsoFile nso;
