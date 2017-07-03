@@ -22,63 +22,6 @@
 
 #define DW_EH_PE_indirect       0x80
 
-typedef uintptr_t _Unwind_Word;
-typedef intptr_t _Unwind_Sword;
-typedef uintptr_t _Unwind_Ptr;
-typedef uintptr_t _Unwind_Internal_Ptr;
-typedef uint64_t _Unwind_Exception_Class;
-
-typedef intptr_t _sleb128_t;
-typedef uintptr_t _uleb128_t;
-
-
-/* Read an unsigned leb128 value from P, store the value in VAL, return
-P incremented past the value.  We assume that a word is large enough to
-hold any value so encoded; if it is smaller than a pointer on some target,
-pointers should not be leb128 encoded on that target.  */
-static const unsigned char *
-read_uleb128(const unsigned char *p, _Unwind_Word *val)
-{
-	unsigned int shift = 0;
-	unsigned char byte;
-	_Unwind_Word result;
-
-	result = 0;
-	do
-	{
-		byte = *p++;
-		result |= ((_Unwind_Word)byte & 0x7f) << shift;
-		shift += 7;
-	} while (byte & 0x80);
-
-	*val = result;
-	return p;
-}
-
-/* Similar, but read a signed leb128 value.  */
-static const unsigned char *
-read_sleb128(const unsigned char *p, _Unwind_Sword *val)
-{
-	unsigned int shift = 0;
-	unsigned char byte;
-	_Unwind_Word result;
-
-	result = 0;
-	do
-	{
-		byte = *p++;
-		result |= ((_Unwind_Word)byte & 0x7f) << shift;
-		shift += 7;
-	} while (byte & 0x80);
-
-	/* Sign-extend a negative value.  */
-	if (shift < 8 * sizeof(result) && (byte & 0x40) != 0)
-		result |= -(((_Unwind_Word)1L) << shift);
-
-	*val = (_Unwind_Sword)result;
-	return p;
-}
-
 bool ElfEHInfo::MeasureFrame(const eh_frame_hdr *hdr, uintptr_t *eh_frame_ptr, size_t *eh_frame_len) {
 	if (hdr->version != 1) {
 		return false;

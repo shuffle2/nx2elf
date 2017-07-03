@@ -120,8 +120,8 @@ struct NsoFile {
 		u32 field_8;
 		u32 field_c;
 		SegmentHeader segments[kNumSegment];
-		sha1_digest gnu_build_id;
-		u8 field_54[0xc];
+		// value from .note, can be various lengths :/
+		std::array<u8, 32> gnu_build_id;
 		u32 segment_file_sizes[kNumSegment];
 		u32 field_6c[9];
 		DataExtent dynstr;
@@ -225,7 +225,7 @@ struct NsoFile {
 			return false;
 		// assume segments are after each other and mem offsets are aligned
 		// note: there are also symbols "_start" and "end" which describe the total size
-		auto &data_seg = header->segments[2];
+		auto &data_seg = header->segments[kData];
 		size_t image_size = data_seg.mem_offset + data_seg.mem_size + data_seg.bss_align;
 		image = std::vector<u8>(image_size);
 
@@ -237,6 +237,11 @@ struct NsoFile {
 			}
 		}
 
+		/*
+		fs::path dump(path);
+		File::Write(dump.replace_extension(".bin"), image);
+		//*/
+
 		auto mod_offset = *reinterpret_cast<u32 *>(&image[4]);
 		auto mod_base = &image[mod_offset];
 		auto mod = reinterpret_cast<ModHeader *>(mod_base);
@@ -244,13 +249,29 @@ struct NsoFile {
 			return false;
 
 		dynamic = reinterpret_cast<Elf64_Dyn *>(mod_base + mod->dynamic_offset);
-		// It seems the nss-name, MOD, and note sections are always next to each other,
-		// but in indeterminate order...
-		GnuBuildId gnu_build_id_needle = {
-			{ sizeof(GnuBuildId::owner), sizeof(GnuBuildId::build_id), 3 },
+
+		// Kinda gross, but hopefully unique enough to avoid false positives...
+		GnuBuildId md5_build_id_needle = {
+			{ sizeof(GnuBuildId::owner), sizeof(GnuBuildId::build_id_md5), 3 },
 			{ 'G', 'N', 'U' }
 		};
-		note = reinterpret_cast<Elf64_Nhdr *>(memmem(mod_base - 0x100, 0x200, &gnu_build_id_needle, offsetof(GnuBuildId, build_id)));
+		GnuBuildId sha1_build_id_needle = {
+			{ sizeof(GnuBuildId::owner), sizeof(GnuBuildId::build_id_sha1), 3 },
+			{ 'G', 'N', 'U' }
+		};
+		for (auto i : {kRodata, kText, kData}) {
+			auto &seg = header->segments[i];
+			note = reinterpret_cast<Elf64_Nhdr *>(memmemr(&image[seg.mem_offset], seg.mem_size,
+				&md5_build_id_needle, offsetof(GnuBuildId, build_id_md5)));
+			if (note) {
+				break;
+			}
+			note = reinterpret_cast<Elf64_Nhdr *>(memmemr(&image[seg.mem_offset], seg.mem_size,
+				&sha1_build_id_needle, offsetof(GnuBuildId, build_id_sha1)));
+			if (note) {
+				break;
+			}
+		}
 
 		auto eh_start_ptr = reinterpret_cast<u8 *>(mod_base + mod->eh_start_offset);
 		auto eh_end_ptr = reinterpret_cast<u8 *>(mod_base + mod->eh_end_offset);
@@ -297,7 +318,7 @@ struct NsoFile {
 			printf("%16llx %8x %8x %16llx\n", rela.r_offset, ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info), rela.r_addend);
 		}
 
-		auto rodata = &image[header->segments[1].mem_offset];
+		auto rodata = &image[header->segments[kRodata].mem_offset];
 		auto dynstr = reinterpret_cast<const char *>(&rodata[header->dynstr.offset]);
 		puts("symbols:");
 		iter_dynsym([&](const Elf64_Sym& sym) {
@@ -307,7 +328,7 @@ struct NsoFile {
 		});
 	}
 	void iter_dynsym(std::function<void(const Elf64_Sym&)> func) {
-		auto rodata = &image[header->segments[1].mem_offset];
+		auto rodata = &image[header->segments[kRodata].mem_offset];
 		auto sym = reinterpret_cast<Elf64_Sym *>(&rodata[header->dynsym.offset]);
 		auto dynstr = reinterpret_cast<const char *>(&rodata[header->dynstr.offset]);
 		for (size_t i = 0; i < header->dynsym.size / sizeof(Elf64_Sym); i++, sym++) {
@@ -321,10 +342,10 @@ struct NsoFile {
 		// Profile sections based on dynsym
 		u16 num_shdrs = 0;
 		std::unordered_map<u16, Elf64_Shdr> known_sections;
-		auto sym_to_shdr = [&](const Elf64_Sym& sym) {
+		auto vaddr_to_shdr = [&](u64 vaddr) {
 			Elf64_Shdr shdr{};
 			for (int i = 0; i < kNumSegment; i++) {
-				u64 location = sym.st_value;
+				u64 location = vaddr;
 				auto &seg = header->segments[i];
 				auto seg_mem_end = seg.mem_offset + seg.mem_size;
 				// sh_offset will be fixed up later
@@ -368,9 +389,12 @@ struct NsoFile {
 			return shdr;
 		};
 		iter_dynsym([&](const Elf64_Sym& sym) {
+			if (sym.st_shndx >= SHN_LORESERVE) {
+				return;
+			}
 			num_shdrs = std::max(num_shdrs, sym.st_shndx);
 			if (sym.st_shndx != SHT_NULL && !known_sections.count(sym.st_shndx)) {
-				auto shdr = sym_to_shdr(sym);
+				auto shdr = vaddr_to_shdr(sym.st_value);
 				if (shdr.sh_type != SHT_NULL) {
 					known_sections[sym.st_shndx] = shdr;
 				}
@@ -379,6 +403,40 @@ struct NsoFile {
 				}
 			}
 		});
+		// Check if we need to manually add the known segments (nothing was pointing to them,
+		// so they can go anywhere).
+		if (known_sections.size() < kData + 1) {
+			auto next_free = [&known_sections] (u16 start) -> u16 {
+				for (u16 i = start + 1; i < SHN_LORESERVE; i++) {
+					if (!known_sections.count(i)) {
+						return i;
+					}
+				}
+				return SHN_UNDEF;
+			};
+			u16 shndx = next_free(SHN_UNDEF);
+			if (shndx != SHN_UNDEF && !shstrtab.GetOffset(".text") &&
+				header->segments[kText].mem_size > 0) {
+				known_sections[shndx] = vaddr_to_shdr(header->segments[kText].mem_offset);
+				shndx = next_free(shndx);
+			}
+			if (shndx != SHN_UNDEF && !shstrtab.GetOffset(".rodata") &&
+				header->segments[kRodata].mem_size > 0) {
+				known_sections[shndx] = vaddr_to_shdr(header->segments[kRodata].mem_offset);
+				shndx = next_free(shndx);
+			}
+			if (shndx != SHN_UNDEF && !shstrtab.GetOffset(".data") &&
+				header->segments[kData].mem_size > 0) {
+				known_sections[shndx] = vaddr_to_shdr(header->segments[kData].mem_offset);
+				shndx = next_free(shndx);
+			}
+			if (shndx != SHN_UNDEF && !shstrtab.GetOffset(".bss") &&
+				header->segments[kData].bss_align > 0) {
+				known_sections[shndx] = vaddr_to_shdr(
+					header->segments[kData].mem_offset + header->segments[kData].mem_size);
+				shndx = next_free(shndx);
+			}
+		}
 		// +1 to go from index -> count
 		num_shdrs++;
 
@@ -987,18 +1045,18 @@ struct NsoFile {
 	}
 	
 	std::vector<u8> file;
-	const Header *header;
+	const Header *header{};
 
 	std::vector<u8> image;
-	const Elf64_Dyn *dynamic;
-	const Elf64_Nhdr *note;
+	const Elf64_Dyn *dynamic{};
+	const Elf64_Nhdr *note{};
 	
 	struct {
 		u64 hdr_addr;
 		u64 hdr_size;
 		u64 frame_addr;
 		u64 frame_size;
-	} eh_info;
+	} eh_info{};
 };
 
 static bool NsoToElf(const fs::path& path, bool verbose = false) {

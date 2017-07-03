@@ -259,5 +259,8 @@ struct Elf64_Nhdr {
 struct GnuBuildId {
 	Elf64_Nhdr header;
 	std::array<char, 4> owner;
-	sha1_digest build_id;
+	union {
+		md5_digest build_id_md5;
+		sha1_digest build_id_sha1;
+	};
 };

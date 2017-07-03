@@ -14,6 +14,7 @@ typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
 
+typedef std::array<u8, 16> md5_digest;
 typedef std::array<u8, 20> sha1_digest;
 typedef std::array<u8, 32> sha256_digest;
 
@@ -55,6 +56,19 @@ inline void *memmem_m(const void *haystack, size_t haystack_len, const void *nee
 			return p;
 		}
 		p++;
+	}
+	return nullptr;
+}
+
+inline void *memmemr(const void *haystack, size_t haystack_len, const void *needle,
+	size_t needle_len) {
+	u8 *p = (u8 *)haystack + haystack_len - needle_len;
+	u8 *e = (u8 *)haystack;
+	while (p >= e) {
+		if (!memcmp(p, needle, needle_len)) {
+			return p;
+		}
+		p--;
 	}
 	return nullptr;
 }
