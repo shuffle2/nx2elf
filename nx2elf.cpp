@@ -539,7 +539,7 @@ struct NsoFile {
 				0xd61f0220, 0xd503201f, 0xd503201f, 0xd503201f
 			};
 			const u32 plt_mask[ARRAY_SIZE(plt_pattern)]{
-				0xffffffff, 0xff000000, 0xff000000, 0xff000000,
+				0xffffffff, 0x00000000, 0xff000000, 0xff000000,
 				0xff000000, 0xffffffff, 0xffffffff, 0xffffffff
 			};
 			auto &text_seg = header->segments[kText];
@@ -784,7 +784,7 @@ struct NsoFile {
 			shdr.sh_size = init_ret_offset;
 			shdr.sh_addralign = sizeof(u32);
 			if (insert_shdr(shdr, true) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .init\n");
+				fputs("failed to insert new shdr for .init", stderr);
 			}
 		}
 
@@ -798,7 +798,7 @@ struct NsoFile {
 			shdr.sh_size = fini_branch_offset;
 			shdr.sh_addralign = sizeof(u32);
 			if (insert_shdr(shdr, true) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .fini\n");
+				fputs("failed to insert new shdr for .fini", stderr);
 			}
 		}
 
@@ -812,7 +812,7 @@ struct NsoFile {
 		shdr.sh_addralign = sizeof(char);
 		u32 dynstr_shndx = insert_shdr(shdr);
 		if (dynstr_shndx == SHN_UNDEF) {
-			fprintf(stderr, "failed to insert new shdr for .dynstr\n");
+			fputs("failed to insert new shdr for .dynstr", stderr);
 		}
 
 		u32 last_local_dynsym_index = 0;
@@ -834,7 +834,7 @@ struct NsoFile {
 		shdr.sh_entsize = sizeof(Elf64_Sym);
 		u32 dynsym_shndx = insert_shdr(shdr);
 		if (dynsym_shndx == SHN_UNDEF) {
-			fprintf(stderr, "failed to insert new shdr for .dynsym\n");
+			fputs("failed to insert new shdr for .dynsym", stderr);
 		}
 
 		auto dyn_phdr = &phdrs[kData + 1];
@@ -849,7 +849,7 @@ struct NsoFile {
 		shdr.sh_addralign = dyn_phdr->p_align;
 		shdr.sh_entsize = sizeof(Elf64_Dyn);
 		if (insert_shdr(shdr) == SHN_UNDEF) {
-			fprintf(stderr, "failed to insert new shdr for .dynamic\n");
+			fputs("failed to insert new shdr for .dynamic", stderr);
 		}
 
 		shdr = {};
@@ -863,7 +863,7 @@ struct NsoFile {
 		shdr.sh_addralign = sizeof(u64);
 		shdr.sh_entsize = sizeof(Elf64_Rela);
 		if (insert_shdr(shdr) == SHN_UNDEF) {
-			fprintf(stderr, "failed to insert new shdr for .rela.dyn\n");
+			fputs("failed to insert new shdr for .rela.dyn", stderr);
 		}
 
 		u32 plt_shndx = SHN_UNDEF;
@@ -882,7 +882,7 @@ struct NsoFile {
 			shdr.sh_entsize = 0x10;
 			plt_shndx = insert_shdr(shdr, true);
 			if (plt_shndx == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .plt\n");
+				fputs("failed to insert new shdr for .plt", stderr);
 			}
 		}
 
@@ -904,7 +904,7 @@ struct NsoFile {
 			shdr.sh_addralign = sizeof(u64);
 			shdr.sh_entsize = sizeof(u64);
 			if (insert_shdr(shdr, true) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .got\n");
+				fputs("failed to insert new shdr for .got", stderr);
 			}
 		}
 
@@ -919,11 +919,14 @@ struct NsoFile {
 			shdr.sh_addralign = sizeof(u64);
 			shdr.sh_entsize = sizeof(u64);
 			if (insert_shdr(shdr, true) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .got.plt\n");
+				fputs("failed to insert new shdr for .got.plt", stderr);
 			}
 		}
 
 		if (present.rela_plt) {
+			if (!present.plt) {
+				fputs("warning: .rela.plt with no .plt", stderr);
+			}
 			shdr = {};
 			shdr.sh_name = shstrtab.GetOffset(".rela.plt");
 			shdr.sh_type = SHT_RELA;
@@ -939,7 +942,7 @@ struct NsoFile {
 			shdr.sh_addralign = sizeof(u64);
 			shdr.sh_entsize = sizeof(Elf64_Rela);
 			if (insert_shdr(shdr) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .rela.plt\n");
+				fputs("failed to insert new shdr for .rela.plt", stderr);
 			}
 		}
 
@@ -953,7 +956,7 @@ struct NsoFile {
 			shdr.sh_size = dyn_info.init_arraysz;
 			shdr.sh_addralign = sizeof(u64);
 			if (insert_shdr(shdr, true) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .init_array\n");
+				fputs("failed to insert new shdr for .init_array", stderr);
 			}
 		}
 
@@ -967,7 +970,7 @@ struct NsoFile {
 			shdr.sh_size = dyn_info.fini_arraysz;
 			shdr.sh_addralign = sizeof(u64);
 			if (insert_shdr(shdr, true) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .fini_array\n");
+				fputs("failed to insert new shdr for .fini_array", stderr);
 			}
 		}
 
@@ -987,7 +990,7 @@ struct NsoFile {
 			shdr.sh_addralign = sizeof(u64);
 			shdr.sh_entsize = sizeof(u32);
 			if (insert_shdr(shdr) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .hash\n");
+				fputs("failed to insert new shdr for .hash", stderr);
 			}
 		}
 
@@ -1014,7 +1017,7 @@ struct NsoFile {
 			shdr.sh_addralign = sizeof(u64);
 			shdr.sh_entsize = sizeof(u32);
 			if (insert_shdr(shdr) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .gnu.hash\n");
+				fputs("failed to insert new shdr for .gnu.hash", stderr);
 			}
 		}
 
@@ -1028,7 +1031,7 @@ struct NsoFile {
 			shdr.sh_size = sizeof(*note) + note->n_descsz + note->n_namesz;
 			shdr.sh_addralign = sizeof(u32);
 			if (insert_shdr(shdr) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .note\n");
+				fputs("failed to insert new shdr for .note", stderr);
 			}
 		}
 
@@ -1042,7 +1045,7 @@ struct NsoFile {
 			shdr.sh_size = eh_info.hdr_size;
 			shdr.sh_addralign = sizeof(u32);
 			if (insert_shdr(shdr, true) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .eh_frame_hdr\n");
+				fputs("failed to insert new shdr for .eh_frame_hdr", stderr);
 			}
 			shdr = {};
 			shdr.sh_name = shstrtab.GetOffset(".eh_frame");
@@ -1053,7 +1056,7 @@ struct NsoFile {
 			shdr.sh_size = eh_info.frame_size;
 			shdr.sh_addralign = sizeof(u32);
 			if (insert_shdr(shdr, true) == SHN_UNDEF) {
-				fprintf(stderr, "failed to insert new shdr for .eh_frame\n");
+				fputs("failed to insert new shdr for .eh_frame", stderr);
 			}
 		}
 
@@ -1065,7 +1068,7 @@ struct NsoFile {
 		shdr.sh_addralign = sizeof(char);
 		ehdr->e_shstrndx = insert_shdr(shdr);
 		if (ehdr->e_shstrndx == SHN_UNDEF) {
-			fprintf(stderr, "failed to insert new shdr for .shstrtab\n");
+			fputs("failed to insert new shdr for .shstrtab", stderr);
 		}
 
 		return File::Write(path, elf);
@@ -1110,7 +1113,7 @@ static bool NsoToElf(const fs::path& path, bool verbose = false) {
 
 int main(int argc, char **argv) {
 	if (argc < 2 || !fs::exists(argv[1])) {
-		fprintf(stderr, "file or directory");
+		fputs("file or directory", stderr);
 		return 1;
 	}
 
