@@ -96,6 +96,11 @@ struct StringTable {
 };
 
 struct NsoFile {
+	enum FileType {
+		kUnknown,
+		kNso,
+		kNro,
+	};
 	enum SegmentType {
 		kText,
 		kRodata,
@@ -103,6 +108,7 @@ struct NsoFile {
 		kNumSegment
 	};
 	static const std::array<u8, 4> nso_magic;
+	static const std::array<u8, 4> nro_magic;
 	static const std::array<u8, 4> mod_magic;
 	struct SegmentHeader {
 		u32 file_offset; // maybe &1==compressed?
@@ -114,7 +120,7 @@ struct NsoFile {
 		u32 offset;
 		u32 size;
 	};
-	struct Header {
+	struct NsoHeader {
 		u8 magic[4];
 		u32 field_4;
 		u32 field_8;
@@ -129,6 +135,9 @@ struct NsoFile {
 		sha256_digest segment_digests[kNumSegment];
 	};
 	struct ModHeader {
+		// yaya, there are some fields here...for parsing, easier to ignore.
+		//u32 field_0;
+		//u32 magic_offset;
 		u8 magic[4];
 		s32 dynamic_offset;
 		s32 bss_start_offset;
@@ -142,8 +151,16 @@ struct NsoFile {
 	bool Open(const fs::path& path) {
 		file = File::Read(path);
 		#define CHK(x) if (!(x)) return false;
-		CHK(file.size() >= sizeof(Header));
-		CHK(!memcmp(&file[0], &nso_magic[0], nso_magic.size()));
+		CHK(file.size() >= sizeof(NsoHeader));
+		if (!memcmp(&file[0], &nso_magic[0], nso_magic.size())) {
+			file_type = kNso;
+		}
+		/*
+		else if (!memcmp(&file[0], &nro_magic[0], nro_magic.size())) {
+			file_type = kNro;
+		}
+		//*/
+		CHK(file_type != kUnknown);
 		#undef CHK
 		header = reinterpret_cast<decltype(header)>(&file[0]);
 		return true;
@@ -198,7 +215,7 @@ struct NsoFile {
 
 		#undef FMT_FIELD
 
-		printf(msg);
+		printf("%s", msg);
 	}
 	bool Decompress(u8 *dst, u32 dst_len, const u8 *src, u32 src_len) {
 		int len = LZ4_decompress_safe(reinterpret_cast<const char *>(src),
@@ -251,11 +268,11 @@ struct NsoFile {
 		dynamic = reinterpret_cast<Elf64_Dyn *>(mod_base + mod->dynamic_offset);
 
 		// Kinda gross, but hopefully unique enough to avoid false positives...
-		GnuBuildId md5_build_id_needle = {
+		const GnuBuildId md5_build_id_needle = {
 			{ sizeof(GnuBuildId::owner), sizeof(GnuBuildId::build_id_md5), 3 },
 			{ 'G', 'N', 'U' }
 		};
-		GnuBuildId sha1_build_id_needle = {
+		const GnuBuildId sha1_build_id_needle = {
 			{ sizeof(GnuBuildId::owner), sizeof(GnuBuildId::build_id_sha1), 3 },
 			{ 'G', 'N', 'U' }
 		};
@@ -291,7 +308,7 @@ struct NsoFile {
 			u64 num_jmprel;
 		} dyn_info;
 		for (auto dyn = dynamic; dyn->d_tag; dyn++) {
-			printf("%16llx %16llx\n", dyn->d_tag, dyn->d_un);
+			printf("%16" PRIx64 " %16" PRIx64 "\n", dyn->d_tag, dyn->d_un);
 
 		#define DT_ASSIGN_PTR(dt, var, x) \
 			case dt: var = reinterpret_cast<decltype(var)>((x)); break;
@@ -310,29 +327,31 @@ struct NsoFile {
 		puts("rela:");
 		for (size_t i = 0; i < dyn_info.num_rela; i++) {
 			auto &rela = dyn_info.rela[i];
-			printf("%16llx %8x %8x %16llx\n", rela.r_offset, ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info), rela.r_addend);
+			printf("%16" PRIx64 " %8x %8x %16" PRIx64 "\n", rela.r_offset,
+				ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info), rela.r_addend);
 		}
 		puts("jmprel:");
 		for (size_t i = 0; i < dyn_info.num_jmprel; i++) {
 			auto &rela = dyn_info.jmprel[i];
-			printf("%16llx %8x %8x %16llx\n", rela.r_offset, ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info), rela.r_addend);
+			printf("%16" PRIx64 " %8x %8x %16" PRIx64 "x\n", rela.r_offset,
+				ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info), rela.r_addend);
 		}
 
 		auto rodata = &image[header->segments[kRodata].mem_offset];
 		auto dynstr = reinterpret_cast<const char *>(&rodata[header->dynstr.offset]);
 		puts("symbols:");
-		iter_dynsym([&](const Elf64_Sym& sym) {
+		iter_dynsym([&](const Elf64_Sym& sym, u32) {
 			auto name = &dynstr[sym.st_name];
-			printf("%x %x %x %4x %16llx %16llx %s\n", ELF64_ST_BIND(sym.st_info), ELF64_ST_TYPE(sym.st_info),
-				ELF64_ST_VISIBILITY(sym.st_other), sym.st_shndx, sym.st_value, sym.st_size, name);
+			printf("%x %x %x %4x %16" PRIx64 " %16" PRIx64 " %s\n", ELF64_ST_BIND(sym.st_info),
+				ELF64_ST_TYPE(sym.st_info), ELF64_ST_VISIBILITY(sym.st_other),
+				sym.st_shndx, sym.st_value, sym.st_size, name);
 		});
 	}
-	void iter_dynsym(std::function<void(const Elf64_Sym&)> func) {
+	void iter_dynsym(std::function<void(const Elf64_Sym&, u32)> func) {
 		auto rodata = &image[header->segments[kRodata].mem_offset];
 		auto sym = reinterpret_cast<Elf64_Sym *>(&rodata[header->dynsym.offset]);
-		auto dynstr = reinterpret_cast<const char *>(&rodata[header->dynstr.offset]);
-		for (size_t i = 0; i < header->dynsym.size / sizeof(Elf64_Sym); i++, sym++) {
-			func(*sym);
+		for (u32 i = 0; i < header->dynsym.size / sizeof(Elf64_Sym); i++, sym++) {
+			func(*sym, i);
 		}
 	}
 	bool WriteElf(const fs::path& path) {
@@ -388,7 +407,7 @@ struct NsoFile {
 			}
 			return shdr;
 		};
-		iter_dynsym([&](const Elf64_Sym& sym) {
+		iter_dynsym([&](const Elf64_Sym& sym, u32) {
 			if (sym.st_shndx >= SHN_LORESERVE) {
 				return;
 			}
@@ -745,7 +764,7 @@ struct NsoFile {
 			}
 			// failed to find open spot with restrictions, so try again at any location
 			if (ordered && start != 1) {
-				fprintf(stderr, "warning: failed to meet ordering for sh_addr %16llx\n",
+				fprintf(stderr, "warning: failed to meet ordering for sh_addr %16" PRIx64 "\n",
 					shdr.sh_addr);
 				start = 1;
 				goto retry;
@@ -796,6 +815,12 @@ struct NsoFile {
 			fprintf(stderr, "failed to insert new shdr for .dynstr\n");
 		}
 
+		u32 last_local_dynsym_index = 0;
+		iter_dynsym([&](const Elf64_Sym& sym, u32 index) {
+			if (ELF64_ST_BIND(sym.st_info) == STB_LOCAL) {
+				last_local_dynsym_index = std::max(last_local_dynsym_index, index);
+			}
+		});
 		shdr = {};
 		shdr.sh_name = shstrtab.GetOffset(".dynsym");
 		shdr.sh_type = SHT_DYNSYM;
@@ -804,8 +829,7 @@ struct NsoFile {
 		shdr.sh_offset = phdrs[kRodata].p_offset + header->dynsym.offset;
 		shdr.sh_size = header->dynsym.size;
 		shdr.sh_link = dynstr_shndx;
-		// TODO set sh_info "symtab index of last STB_LOCAL + 1"?
-		//shdr.sh_info = 3;
+		shdr.sh_info = last_local_dynsym_index + 1;
 		shdr.sh_addralign = sizeof(u64);
 		shdr.sh_entsize = sizeof(Elf64_Sym);
 		u32 dynsym_shndx = insert_shdr(shdr);
@@ -1043,9 +1067,11 @@ struct NsoFile {
 
 		return File::Write(path, elf);
 	}
+
+	FileType file_type{ kUnknown };
 	
 	std::vector<u8> file;
-	const Header *header{};
+	const NsoHeader *header{};
 
 	std::vector<u8> image;
 	const Elf64_Dyn *dynamic{};
@@ -1058,8 +1084,9 @@ struct NsoFile {
 		u64 frame_size;
 	} eh_info{};
 };
-const std::array<u8, 4> NsoFile::nso_magic{ 'N', 'S', 'O', '0' };
-const std::array<u8, 4> NsoFile::mod_magic{ 'M', 'O', 'D', '0' };
+const std::array<u8, 4> NsoFile::nso_magic{ { 'N', 'S', 'O', '0' } };
+const std::array<u8, 4> NsoFile::nro_magic{ { 'N', 'R', 'O', '0' } };
+const std::array<u8, 4> NsoFile::mod_magic{ { 'M', 'O', 'D', '0' } };
 
 static bool NsoToElf(const fs::path& path, bool verbose = false) {
 	NsoFile nso;

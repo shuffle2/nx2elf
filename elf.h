@@ -172,6 +172,10 @@ struct Elf64_Sym {
 
 #define ELF64_ST_VISIBILITY(o)       ((o)&0x3)
 
+#define STB_LOCAL  0
+#define STB_GLOBAL 1
+#define STB_WEAK   2
+
 struct Elf64_Rela {
 	u64 r_offset;
 	u64 r_info;
