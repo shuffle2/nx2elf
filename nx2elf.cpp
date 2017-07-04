@@ -134,10 +134,30 @@ struct NsoFile {
 		DataExtent dynsym;
 		sha256_digest segment_digests[kNumSegment];
 	};
+	// NRO stores the flat memory image - nothing needs to be decompressed or
+	// relocated (although relocation fixups need to be applied). This also
+	// implies that +4 in the file points to MOD header, so NRO header is at
+	// offset 0x10 instead of 0.
+	struct NroHeader {
+		u8 magic[4];
+		u32 field_4;
+		u32 file_size;
+		u32 field_c;
+		DataExtent segments[kNumSegment];
+		u32 bss_size;
+		u32 field_3c;
+		std::array<u8, 32> gnu_build_id;
+		u32 field_60[4];
+		DataExtent dynstr;
+		DataExtent dynsym;
+	};
+	struct ModPointer {
+		u32 field_0;
+		u32 magic_offset;
+	};
 	struct ModHeader {
 		// yaya, there are some fields here...for parsing, easier to ignore.
-		//u32 field_0;
-		//u32 magic_offset;
+		//ModPointer mod_ptr;
 		u8 magic[4];
 		s32 dynamic_offset;
 		s32 bss_start_offset;
@@ -148,23 +168,6 @@ struct NsoFile {
 		// It seems the area around MOD0 is used for .note section
 		// There is also a nss-name section
 	};
-	bool Open(const fs::path& path) {
-		file = File::Read(path);
-		#define CHK(x) if (!(x)) return false;
-		CHK(file.size() >= sizeof(NsoHeader));
-		if (!memcmp(&file[0], &nso_magic[0], nso_magic.size())) {
-			file_type = kNso;
-		}
-		/*
-		else if (!memcmp(&file[0], &nro_magic[0], nro_magic.size())) {
-			file_type = kNro;
-		}
-		//*/
-		CHK(file_type != kUnknown);
-		#undef CHK
-		header = reinterpret_cast<decltype(header)>(&file[0]);
-		return true;
-	}
 	template<typename T>
 	char *FormatBytes(char *p, T d) {
 		for (auto &b : d)
@@ -176,7 +179,7 @@ struct NsoFile {
 		char *p = msg;
 		const char *idx2prot[kNumSegment] = { "r-x", "r--", "rw-" };
 
-		#define FMT_FIELD(f) p += sprintf(p, #f ": %8x\n", header->f);
+		#define FMT_FIELD(f) p += sprintf(p, #f ": %8x\n", header.f);
 		
 		if (verbose) {
 			FMT_FIELD(field_4);
@@ -185,31 +188,31 @@ struct NsoFile {
 		}
 
 		p += sprintf(p, "gnu_build_id: ");
-		p = FormatBytes(p, header->gnu_build_id);
+		p = FormatBytes(p, header.gnu_build_id);
 		p += sprintf(p, "\n");
 
 		p += sprintf(p, "         %-8s %-8s %-8s %-8s %-8s\n", "file off",
 			"file len", "mem off", "mem len", "bss/algn");
 		for (int i = 0; i < kNumSegment; i++) {
-			auto &seg = header->segments[i];
-			auto &file_size = header->segment_file_sizes[i];
+			auto &seg = header.segments[i];
+			auto &file_size = header.segment_file_sizes[i];
 			p += sprintf(p, "%d [%-3s]: %8x %8x %8x %8x %8x\n", i, idx2prot[i],
 				seg.file_offset, file_size, seg.mem_offset, seg.mem_size, seg.bss_align);
 		}
 
 		if (verbose) {
-			for (int i = 0; i < ARRAY_SIZE(header->field_6c); i++)
+			for (int i = 0; i < ARRAY_SIZE(header.field_6c); i++)
 				FMT_FIELD(field_6c[i]);
 		}
 
 		p += sprintf(p, ".rodata-relative:\n");
-		p += sprintf(p, "  .dynstr: %8x %8x\n", header->dynstr.offset, header->dynstr.size);
-		p += sprintf(p, "  .dynsym: %8x %8x\n", header->dynsym.offset, header->dynsym.size);
+		p += sprintf(p, "  .dynstr: %8x %8x\n", header.dynstr.offset, header.dynstr.size);
+		p += sprintf(p, "  .dynsym: %8x %8x\n", header.dynsym.offset, header.dynsym.size);
 
 		p += sprintf(p, "segment digests:\n");
 		for (int i = 0; i < kNumSegment; i++) {
 			p += sprintf(p, "%d [%-3s]: ", i, idx2prot[i]);
-			p = FormatBytes(p, header->segment_digests[i]);
+			p = FormatBytes(p, header.segment_digests[i]);
 			p += sprintf(p, "\n");
 		}
 
@@ -224,34 +227,57 @@ struct NsoFile {
 			printf("LZ4_decompress_safe: %8x (expected %8x)\n", len, dst_len);
 		return len > 0;
 	}
-	void DumpSegments() {
-		for (int i = 0; i < kNumSegment; i++) {
-			auto &seg = header->segments[i];
-			auto &file_size = header->segment_file_sizes[i];
-			std::vector<u8> decompressed(seg.mem_size);
-			if (!Decompress(&decompressed[0], seg.mem_size, &file[seg.file_offset], file_size)) {
-				continue;
-			}
-			char path[256];
-			sprintf(path, "./%08x_%08x_dec.bin", seg.mem_offset, seg.mem_offset + seg.mem_size);
-			File::Write(path, decompressed);
-		}
-	}
 	bool Load(const fs::path& path) {
-		if (!Open(path))
-			return false;
-		// assume segments are after each other and mem offsets are aligned
-		// note: there are also symbols "_start" and "end" which describe the total size
-		auto &data_seg = header->segments[kData];
-		size_t image_size = data_seg.mem_offset + data_seg.mem_size + data_seg.bss_align;
-		image = std::vector<u8>(image_size);
+		auto file = File::Read(path);
+		const size_t nro_offset = ALIGN_UP(sizeof(ModPointer), 0x10);
+		if (file.size() >= sizeof(NsoHeader) &&
+			!memcmp(&file[0], &nso_magic[0], nso_magic.size())) {
+			memcpy(&header, &file[0], sizeof(header));
 
-		for (int i = 0; i < kNumSegment; i++) {
-			auto &seg = header->segments[i];
-			auto &file_size = header->segment_file_sizes[i];
-			if (!Decompress(&image[seg.mem_offset], seg.mem_size, &file[seg.file_offset], file_size)) {
+			// assume segments are after each other and mem offsets are aligned
+			// note: there are also symbols "_start" and "end" which describe
+			// the total size.
+			auto &data_seg = header.segments[kData];
+			size_t image_size = data_seg.mem_offset + data_seg.mem_size + data_seg.bss_align;
+			image = std::vector<u8>(image_size);
+
+			for (int i = 0; i < kNumSegment; i++) {
+				auto &seg = header.segments[i];
+				auto &file_size = header.segment_file_sizes[i];
+				if (!Decompress(&image[seg.mem_offset], seg.mem_size,
+					&file[seg.file_offset], file_size)) {
+					return false;
+				}
+			}
+			file_type = kNso;
+		}
+		else if (file.size() >= nro_offset + sizeof(NroHeader) &&
+			!memcmp(&file[nro_offset], &nro_magic[0], nro_magic.size())) {
+			// Translate the nro header to nso, which is a superset
+			auto nro = reinterpret_cast<NroHeader *>(&file[nro_offset]);
+			if (nro->file_size != file.size()) {
 				return false;
 			}
+			for (int i = 0; i < kNumSegment; i++) {
+				auto &seg = header.segments[i];
+				// TODO revisit once some nso with uncompressed segments is seen
+				seg.mem_offset = seg.file_offset = nro->segments[i].offset;
+				seg.mem_size = header.segment_file_sizes[i] = nro->segments[i].size;
+				switch (i) {
+				case kText: seg.bss_align = 0x100; break;
+				case kRodata: seg.bss_align = 1; break;
+				case kData: seg.bss_align = nro->bss_size; break;
+				}
+			}
+			header.gnu_build_id = nro->gnu_build_id;
+			header.dynstr = nro->dynstr;
+			header.dynsym = nro->dynsym;
+
+			image = std::move(file);
+			file_type = kNro;
+		}
+		if (file_type == kUnknown) {
+			return false;
 		}
 
 		/*
@@ -277,7 +303,7 @@ struct NsoFile {
 			{ 'G', 'N', 'U' }
 		};
 		for (auto i : {kRodata, kText, kData}) {
-			auto &seg = header->segments[i];
+			auto &seg = header.segments[i];
 			note = reinterpret_cast<Elf64_Nhdr *>(memmemr(&image[seg.mem_offset], seg.mem_size,
 				&md5_build_id_needle, offsetof(GnuBuildId, build_id_md5)));
 			if (note) {
@@ -337,8 +363,8 @@ struct NsoFile {
 				ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info), rela.r_addend);
 		}
 
-		auto rodata = &image[header->segments[kRodata].mem_offset];
-		auto dynstr = reinterpret_cast<const char *>(&rodata[header->dynstr.offset]);
+		auto rodata = &image[header.segments[kRodata].mem_offset];
+		auto dynstr = reinterpret_cast<const char *>(&rodata[header.dynstr.offset]);
 		puts("symbols:");
 		iter_dynsym([&](const Elf64_Sym& sym, u32) {
 			auto name = &dynstr[sym.st_name];
@@ -348,9 +374,9 @@ struct NsoFile {
 		});
 	}
 	void iter_dynsym(std::function<void(const Elf64_Sym&, u32)> func) {
-		auto rodata = &image[header->segments[kRodata].mem_offset];
-		auto sym = reinterpret_cast<Elf64_Sym *>(&rodata[header->dynsym.offset]);
-		for (u32 i = 0; i < header->dynsym.size / sizeof(Elf64_Sym); i++, sym++) {
+		auto rodata = &image[header.segments[kRodata].mem_offset];
+		auto sym = reinterpret_cast<Elf64_Sym *>(&rodata[header.dynsym.offset]);
+		for (u32 i = 0; i < header.dynsym.size / sizeof(Elf64_Sym); i++, sym++) {
 			func(*sym, i);
 		}
 	}
@@ -365,7 +391,7 @@ struct NsoFile {
 			Elf64_Shdr shdr{};
 			for (int i = 0; i < kNumSegment; i++) {
 				u64 location = vaddr;
-				auto &seg = header->segments[i];
+				auto &seg = header.segments[i];
 				auto seg_mem_end = seg.mem_offset + seg.mem_size;
 				// sh_offset will be fixed up later
 				if (location >= seg.mem_offset && location < seg_mem_end) {
@@ -435,24 +461,24 @@ struct NsoFile {
 			};
 			u16 shndx = next_free(SHN_UNDEF);
 			if (shndx != SHN_UNDEF && !shstrtab.GetOffset(".text") &&
-				header->segments[kText].mem_size > 0) {
-				known_sections[shndx] = vaddr_to_shdr(header->segments[kText].mem_offset);
+				header.segments[kText].mem_size > 0) {
+				known_sections[shndx] = vaddr_to_shdr(header.segments[kText].mem_offset);
 				shndx = next_free(shndx);
 			}
 			if (shndx != SHN_UNDEF && !shstrtab.GetOffset(".rodata") &&
-				header->segments[kRodata].mem_size > 0) {
-				known_sections[shndx] = vaddr_to_shdr(header->segments[kRodata].mem_offset);
+				header.segments[kRodata].mem_size > 0) {
+				known_sections[shndx] = vaddr_to_shdr(header.segments[kRodata].mem_offset);
 				shndx = next_free(shndx);
 			}
 			if (shndx != SHN_UNDEF && !shstrtab.GetOffset(".data") &&
-				header->segments[kData].mem_size > 0) {
-				known_sections[shndx] = vaddr_to_shdr(header->segments[kData].mem_offset);
+				header.segments[kData].mem_size > 0) {
+				known_sections[shndx] = vaddr_to_shdr(header.segments[kData].mem_offset);
 				shndx = next_free(shndx);
 			}
 			if (shndx != SHN_UNDEF && !shstrtab.GetOffset(".bss") &&
-				header->segments[kData].bss_align > 0) {
+				header.segments[kData].bss_align > 0) {
 				known_sections[shndx] = vaddr_to_shdr(
-					header->segments[kData].mem_offset + header->segments[kData].mem_size);
+					header.segments[kData].mem_offset + header.segments[kData].mem_size);
 				shndx = next_free(shndx);
 			}
 		}
@@ -542,7 +568,7 @@ struct NsoFile {
 				0xffffffff, 0x00000000, 0xff000000, 0xff000000,
 				0xff000000, 0xffffffff, 0xffffffff, 0xffffffff
 			};
-			auto &text_seg = header->segments[kText];
+			auto &text_seg = header.segments[kText];
 			auto found = static_cast<u8 *>(memmem_m(&image[text_seg.mem_offset],
 				text_seg.mem_size, plt_pattern, plt_mask, sizeof(plt_pattern)));
 			if (found) {
@@ -636,7 +662,7 @@ struct NsoFile {
 
 		size_t elf_size = sizeof(Elf64_Ehdr) + sizeof(Elf64_Phdr) * num_phdrs + sizeof(Elf64_Shdr) * num_shdrs;
 		elf_size += shstrtab.size;
-		for (auto &seg : header->segments) {
+		for (auto &seg : header.segments) {
 			elf_size += seg.mem_size;
 		}
 		std::vector<u8> elf(elf_size);
@@ -648,7 +674,7 @@ struct NsoFile {
 		ehdr->e_version = EV_CURRENT;
 		ehdr->e_ehsize = sizeof(Elf64_Ehdr);
 		ehdr->e_flags = 0;
-		ehdr->e_entry = header->segments[kText].mem_offset;
+		ehdr->e_entry = header.segments[kText].mem_offset;
 		ehdr->e_phoff = ehdr->e_ehsize;
 		ehdr->e_phentsize = sizeof(Elf64_Phdr);
 		ehdr->e_phnum = num_phdrs;
@@ -677,7 +703,7 @@ struct NsoFile {
 		for (size_t i = 0; i < num_phdrs; i++) {
 			auto phdr = &phdrs[i];
 			if (i < kNumSegment) {
-				auto &seg = header->segments[i];
+				auto &seg = header.segments[i];
 				phdr->p_type = PT_LOAD;
 				switch (i) {
 				case kText: phdr->p_flags = PF_R | PF_X; break;
@@ -806,9 +832,9 @@ struct NsoFile {
 		shdr.sh_name = shstrtab.GetOffset(".dynstr");
 		shdr.sh_type = SHT_STRTAB;
 		shdr.sh_flags = SHF_ALLOC;
-		shdr.sh_addr = header->segments[kRodata].mem_offset + header->dynstr.offset;
-		shdr.sh_offset = phdrs[kRodata].p_offset + header->dynstr.offset;
-		shdr.sh_size = header->dynstr.size;
+		shdr.sh_addr = header.segments[kRodata].mem_offset + header.dynstr.offset;
+		shdr.sh_offset = phdrs[kRodata].p_offset + header.dynstr.offset;
+		shdr.sh_size = header.dynstr.size;
 		shdr.sh_addralign = sizeof(char);
 		u32 dynstr_shndx = insert_shdr(shdr);
 		if (dynstr_shndx == SHN_UNDEF) {
@@ -825,9 +851,9 @@ struct NsoFile {
 		shdr.sh_name = shstrtab.GetOffset(".dynsym");
 		shdr.sh_type = SHT_DYNSYM;
 		shdr.sh_flags = SHF_ALLOC;
-		shdr.sh_addr = header->segments[kRodata].mem_offset + header->dynsym.offset;
-		shdr.sh_offset = phdrs[kRodata].p_offset + header->dynsym.offset;
-		shdr.sh_size = header->dynsym.size;
+		shdr.sh_addr = header.segments[kRodata].mem_offset + header.dynsym.offset;
+		shdr.sh_offset = phdrs[kRodata].p_offset + header.dynsym.offset;
+		shdr.sh_size = header.dynsym.size;
 		shdr.sh_link = dynstr_shndx;
 		shdr.sh_info = last_local_dynsym_index + 1;
 		shdr.sh_addralign = sizeof(u64);
@@ -1004,7 +1030,7 @@ struct NsoFile {
 			size_t gnu_hash_len = sizeof(*gnu_hash);
 			gnu_hash_len += gnu_hash->maskwords * sizeof(u64);
 			gnu_hash_len += gnu_hash->nbuckets * sizeof(u32);
-			u64 dynsymcount = header->dynsym.size / sizeof(Elf64_Sym);
+			u64 dynsymcount = header.dynsym.size / sizeof(Elf64_Sym);
 			gnu_hash_len += (dynsymcount - gnu_hash->symndx) * sizeof(u32);
 			shdr = {};
 			shdr.sh_name = shstrtab.GetOffset(".gnu.hash");
@@ -1076,8 +1102,7 @@ struct NsoFile {
 
 	FileType file_type{ kUnknown };
 	
-	std::vector<u8> file;
-	const NsoHeader *header{};
+	NsoHeader header{};
 
 	std::vector<u8> image;
 	const Elf64_Dyn *dynamic{};
