@@ -927,7 +927,10 @@ struct NsoFile {
 			shdr = {};
 			shdr.sh_name = shstrtab.GetOffset(".rela.plt");
 			shdr.sh_type = SHT_RELA;
-			shdr.sh_flags = SHF_ALLOC | SHF_INFO_LINK;
+			shdr.sh_flags = SHF_ALLOC;
+			if (plt_shndx != SHN_UNDEF) {
+				shdr.sh_flags |= SHF_INFO_LINK;
+			}
 			shdr.sh_addr = dyn_info.jmprel;
 			shdr.sh_offset = vaddr_to_foffset(shdr.sh_addr);
 			shdr.sh_size = dyn_info.pltrelsz;
