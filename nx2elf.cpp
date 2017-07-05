@@ -450,7 +450,7 @@ struct NsoFile {
 		});
 		// Check if we need to manually add the known segments (nothing was pointing to them,
 		// so they can go anywhere).
-		if (known_sections.size() < kData + 1) {
+		if (known_sections.size() != kNumSegment + 1) {
 			auto next_free = [&known_sections] (u16 start) -> u16 {
 				for (u16 i = start + 1; i < SHN_LORESERVE; i++) {
 					if (!known_sections.count(i)) {
