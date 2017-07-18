@@ -100,6 +100,7 @@ struct NsoFile {
 		kUnknown,
 		kNso,
 		kNro,
+		kMod,
 	};
 	enum SegmentType {
 		kText,
@@ -179,8 +180,8 @@ struct NsoFile {
 		char *p = msg;
 		const char *idx2prot[kNumSegment] = { "r-x", "r--", "rw-" };
 
-		#define FMT_FIELD(f) p += sprintf(p, #f ": %8x\n", header.f);
-		
+	#define FMT_FIELD(f) p += sprintf(p, #f ": %8x\n", header.f);
+
 		if (verbose) {
 			FMT_FIELD(field_4);
 			FMT_FIELD(field_8);
@@ -216,7 +217,7 @@ struct NsoFile {
 			p += sprintf(p, "\n");
 		}
 
-		#undef FMT_FIELD
+	#undef FMT_FIELD
 
 		printf("%s", msg);
 	}
@@ -226,6 +227,30 @@ struct NsoFile {
 		if (len != dst_len)
 			printf("LZ4_decompress_safe: %8x (expected %8x)\n", len, dst_len);
 		return len > 0;
+	}
+	bool ResolvePlt(void *base, size_t len) {
+		// Each plt slot is 4 instructions. The first entry fills 2 slots (resolving thunk).
+		if (dyn_info.pltrelsz) {
+			const u32 plt_pattern[]{
+				0xa9bf7bf0, 0xd00004d0, 0xf9428a11, 0x91144210,
+				0xd61f0220, 0xd503201f, 0xd503201f, 0xd503201f
+			};
+			const u32 plt_mask[ARRAY_SIZE(plt_pattern)]{
+				0xffffffff, 0x00000000, 0xff000000, 0xff000000,
+				0xff000000, 0xffffffff, 0xffffffff, 0xffffffff
+			};
+			auto found = static_cast<u8 *>(memmem_m(base, len, plt_pattern,
+				plt_mask, sizeof(plt_pattern)));
+			if (found) {
+				plt_info.addr = found - &image[0];
+				// Assume the plt exactly matches .rela.plt
+				u64 plt_entry_count = dyn_info.pltrelsz / sizeof(Elf64_Rela);
+				const u64 plt_entry_size = sizeof(u32) * 4;
+				plt_info.size = plt_entry_size * 2 + plt_entry_size * plt_entry_count;
+				return true;
+			}
+		}
+		return false;
 	}
 	bool Load(const fs::path& path) {
 		auto file = File::Read(path);
@@ -276,22 +301,147 @@ struct NsoFile {
 			image = std::move(file);
 			file_type = kNro;
 		}
-		if (file_type == kUnknown) {
+
+		u8 *mod_base = nullptr;
+		ModPointer *mod_ptr = nullptr;
+		if (file_type != kUnknown) {
+			mod_ptr = reinterpret_cast<ModPointer *>(&image[0]);
+			if (mod_ptr->magic_offset + sizeof(ModHeader) > image.size()) {
+				return false;
+			}
+			mod_base = &image[mod_ptr->magic_offset];
+		}
+		else if (file.size() >= sizeof(ModPointer)) {
+			// It's not an NSO or NRO, but still need to check for MOD
+			mod_ptr = reinterpret_cast<ModPointer *>(&file[0]);
+			if (mod_ptr->magic_offset + sizeof(ModHeader) > file.size()) {
+				return false;
+			}
+			mod_base = &file[mod_ptr->magic_offset];
+		}
+		else {
 			return false;
 		}
+		auto mod = reinterpret_cast<ModHeader *>(mod_base);
+		if (memcmp(mod->magic, &mod_magic[0], mod_magic.size()))
+			return false;
 
+		if (file_type == kUnknown) {
+			// Apparently there are images which are essentially NROs, but lack
+			// the NRO header, for some reason. This is a pain.
+			image = std::move(file);
+			file_type = kMod;
+		}
 		/*
 		fs::path dump(path);
 		File::Write(dump.replace_extension(".bin"), image);
 		//*/
 
-		auto mod_offset = *reinterpret_cast<u32 *>(&image[4]);
-		auto mod_base = &image[mod_offset];
-		auto mod = reinterpret_cast<ModHeader *>(mod_base);
-		if (memcmp(mod->magic, &mod_magic[0], mod_magic.size()))
-			return false;
+		auto mod_get_offset = [&](s32 relative_offset) {
+			auto ptr = reinterpret_cast<u8 *>(mod_base + relative_offset);
+			auto offset = reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(&image[0]);
+			return static_cast<u32>(offset);
+		};
 
 		dynamic = reinterpret_cast<Elf64_Dyn *>(mod_base + mod->dynamic_offset);
+		for (auto dyn = dynamic; dyn->d_tag; dyn++) {
+		#define DT_ASSIGN_U64(dt, var) \
+			case dt: dyn_info.var = dyn->d_un; break;
+			switch (dyn->d_tag) {
+			DT_ASSIGN_U64(DT_SYMTAB, symtab);
+			DT_ASSIGN_U64(DT_RELA, rela);
+			DT_ASSIGN_U64(DT_RELASZ, relasz);
+			DT_ASSIGN_U64(DT_JMPREL, jmprel);
+			DT_ASSIGN_U64(DT_PLTRELSZ, pltrelsz);
+			DT_ASSIGN_U64(DT_STRTAB, strtab);
+			DT_ASSIGN_U64(DT_STRSZ, strsz);
+			DT_ASSIGN_U64(DT_PLTGOT, pltgot);
+			DT_ASSIGN_U64(DT_HASH, hash);
+			DT_ASSIGN_U64(DT_GNU_HASH, gnu_hash);
+			DT_ASSIGN_U64(DT_INIT, init);
+			DT_ASSIGN_U64(DT_FINI, fini);
+			DT_ASSIGN_U64(DT_INIT_ARRAY, init_array);
+			DT_ASSIGN_U64(DT_INIT_ARRAYSZ, init_arraysz);
+			DT_ASSIGN_U64(DT_FINI_ARRAY, fini_array);
+			DT_ASSIGN_U64(DT_FINI_ARRAYSZ, fini_arraysz);
+			}
+		#undef DT_ASSIGN_U64
+		}
+		if (file_type != kMod) {
+			auto &text_seg = header.segments[kText];
+			ResolvePlt(&image[text_seg.mem_offset], text_seg.mem_size);
+		}
+
+		if (file_type == kMod) {
+			// need to manually build them ...
+			DataExtent segments[kNumSegment]{};
+
+			// XXX hacks...
+			if (!ResolvePlt(&image[0], image.size())) {
+				fputs("error: raw MOD requires .plt. please report this.\n", stderr);
+				return false;
+			}
+			if (dyn_info.symtab >= dyn_info.strtab) {
+				fputs("error: raw MOD requires .dynstr directly after .dynsym. please report this.\n", stderr);
+				return false;
+			}
+			// Need this up-front to be able to iter_dynsym
+			header.dynsym.size = static_cast<u32>(dyn_info.strtab - dyn_info.symtab);
+			// yet another dirty hack. relies on all sections having at least
+			// one symbol pointing into them, and a section symbol existing for .data
+			std::vector<u16> seen_shndx;
+			iter_dynsym([&](const Elf64_Sym& sym, u32) {
+				if (sym.st_shndx == SHN_UNDEF || sym.st_shndx >= SHN_LORESERVE) {
+					return;
+				}
+				seen_shndx.push_back(sym.st_shndx);
+			});
+			std::sort(seen_shndx.begin(), seen_shndx.end());
+			seen_shndx.erase(std::unique(seen_shndx.begin(), seen_shndx.end()), seen_shndx.end());
+			if (seen_shndx.size() != kNumSegment + 1) {
+				fputs("error: raw MOD failed to find .data in .dynsym. please report this.\n", stderr);
+				return false;
+			}
+			iter_dynsym([&](const Elf64_Sym& sym, u32) {
+				if (segments[kData].offset == 0 && ELF64_ST_TYPE(sym.st_info) == STT_SECTION &&
+					sym.st_shndx == seen_shndx[kData]) {
+					segments[kData].offset = sym.st_value;
+				}
+			});
+			if (segments[kData].offset == 0) {
+				fputs("error: raw MOD failed to find .data in .dynsym. please report this.\n", stderr);
+				return false;
+			}
+
+			segments[kText].offset = 0;
+			segments[kText].size = static_cast<u32>(plt_info.addr + plt_info.size);
+			segments[kRodata].offset = ALIGN_UP(segments[kText].offset + segments[kText].size, 0x1000);
+			segments[kRodata].size = segments[kData].offset - segments[kRodata].offset;
+			segments[kData].size = static_cast<u32>(image.size() - segments[kData].offset);
+
+			header.dynstr.offset = static_cast<u32>(dyn_info.strtab - segments[kRodata].offset);
+			header.dynstr.size = static_cast<u32>(dyn_info.strsz);
+			header.dynsym.offset = static_cast<u32>(dyn_info.symtab - segments[kRodata].offset);
+
+			for (int i = 0; i < kNumSegment; i++) {
+				auto &seg = header.segments[i];
+				seg.mem_offset = seg.file_offset = segments[i].offset;
+				seg.mem_size = header.segment_file_sizes[i] = segments[i].size;
+				switch (i) {
+				case kText: seg.bss_align = 0x100; break;
+				case kRodata: seg.bss_align = 1; break;
+				case kData:
+					// This is the actual size cleared by init code, but there
+					// is a symbol named "end" which will be referenced and is
+					// at the aligned boundary. So pad it out until there.
+					// This is debatably a bug in nintendo's tools.
+					seg.bss_align = mod_get_offset(mod->bss_end_offset) -
+						mod_get_offset(mod->bss_start_offset);
+					seg.bss_align = ALIGN_UP(seg.bss_align, 0x1000) + 1;
+					break;
+				}
+			}
+		}
 
 		// Kinda gross, but hopefully unique enough to avoid false positives...
 		const GnuBuildId md5_build_id_needle = {
@@ -302,7 +452,7 @@ struct NsoFile {
 			{ sizeof(GnuBuildId::owner), sizeof(GnuBuildId::build_id_sha1), 3 },
 			{ 'G', 'N', 'U' }
 		};
-		for (auto i : {kRodata, kText, kData}) {
+		for (auto i : { kRodata, kText, kData }) {
 			auto &seg = header.segments[i];
 			note = reinterpret_cast<Elf64_Nhdr *>(memmemr(&image[seg.mem_offset], seg.mem_size,
 				&md5_build_id_needle, offsetof(GnuBuildId, build_id_md5)));
@@ -316,13 +466,15 @@ struct NsoFile {
 			}
 		}
 
-		auto eh_start_ptr = reinterpret_cast<u8 *>(mod_base + mod->eh_start_offset);
-		auto eh_end_ptr = reinterpret_cast<u8 *>(mod_base + mod->eh_end_offset);
-		auto eh_start = reinterpret_cast<uintptr_t>(eh_start_ptr) - reinterpret_cast<uintptr_t>(&image[0]);
-		auto eh_end = reinterpret_cast<uintptr_t>(eh_end_ptr) - reinterpret_cast<uintptr_t>(&image[0]);
-		eh_info.hdr_addr = eh_start;
-		eh_info.hdr_size = eh_end - eh_start;
-		
+		// In case of MOD-only file, we can only fill in build id if the section was found manually
+		if (file_type == kMod && note) {
+			auto build_id = reinterpret_cast<const GnuBuildId *>(note);
+			memcpy(header.gnu_build_id.data(), build_id->build_id_raw.data(), build_id->header.n_descsz);
+		}
+
+		eh_info.hdr_addr = mod_get_offset(mod->eh_start_offset);
+		eh_info.hdr_size = mod_get_offset(mod->eh_end_offset) - eh_info.hdr_addr;
+
 		return true;
 	}
 	void DumpElfInfo() {
@@ -332,33 +484,33 @@ struct NsoFile {
 			u64 num_rela;
 			Elf64_Rela *jmprel;
 			u64 num_jmprel;
-		} dyn_info;
+		} rela_info;
 		for (auto dyn = dynamic; dyn->d_tag; dyn++) {
 			printf("%16" PRIx64 " %16" PRIx64 "\n", dyn->d_tag, dyn->d_un);
 
 		#define DT_ASSIGN_PTR(dt, var, x) \
-			case dt: var = reinterpret_cast<decltype(var)>((x)); break;
+			case dt: rela_info.var = reinterpret_cast<decltype(rela_info.var)>((x)); break;
 		#define DT_ASSIGN_U64(dt, var, x) \
-			case dt: var = static_cast<decltype(var)>((x)); break;
+			case dt: rela_info.var = static_cast<decltype(rela_info.var)>((x)); break;
 
 			switch (dyn->d_tag) {
-			DT_ASSIGN_PTR(DT_RELA, dyn_info.rela, &image[dyn->d_un]);
-			DT_ASSIGN_U64(DT_RELASZ, dyn_info.num_rela, dyn->d_un / sizeof(*dyn_info.rela));
-			DT_ASSIGN_PTR(DT_JMPREL, dyn_info.jmprel, &image[dyn->d_un]);
-			DT_ASSIGN_U64(DT_PLTRELSZ, dyn_info.num_jmprel, dyn->d_un / sizeof(*dyn_info.jmprel));
+			DT_ASSIGN_PTR(DT_RELA, rela, &image[dyn->d_un]);
+			DT_ASSIGN_U64(DT_RELASZ, num_rela, dyn->d_un / sizeof(*rela_info.rela));
+			DT_ASSIGN_PTR(DT_JMPREL, jmprel, &image[dyn->d_un]);
+			DT_ASSIGN_U64(DT_PLTRELSZ, num_jmprel, dyn->d_un / sizeof(*rela_info.jmprel));
 			}
 		#undef DT_ASSIGN_U64
 		#undef DT_ASSIGN_PTR
 		}
 		puts("rela:");
-		for (size_t i = 0; i < dyn_info.num_rela; i++) {
-			auto &rela = dyn_info.rela[i];
+		for (size_t i = 0; i < rela_info.num_rela; i++) {
+			auto &rela = rela_info.rela[i];
 			printf("%16" PRIx64 " %8x %8x %16" PRIx64 "\n", rela.r_offset,
 				ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info), rela.r_addend);
 		}
 		puts("jmprel:");
-		for (size_t i = 0; i < dyn_info.num_jmprel; i++) {
-			auto &rela = dyn_info.jmprel[i];
+		for (size_t i = 0; i < rela_info.num_jmprel; i++) {
+			auto &rela = rela_info.jmprel[i];
 			printf("%16" PRIx64 " %8x %8x %16" PRIx64 "x\n", rela.r_offset,
 				ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info), rela.r_addend);
 		}
@@ -374,8 +526,7 @@ struct NsoFile {
 		});
 	}
 	void iter_dynsym(std::function<void(const Elf64_Sym&, u32)> func) {
-		auto rodata = &image[header.segments[kRodata].mem_offset];
-		auto sym = reinterpret_cast<Elf64_Sym *>(&rodata[header.dynsym.offset]);
+		auto sym = reinterpret_cast<Elf64_Sym *>(&image[dyn_info.symtab]);
 		for (u32 i = 0; i < header.dynsym.size / sizeof(Elf64_Sym); i++, sym++) {
 			func(*sym, i);
 		}
@@ -451,7 +602,7 @@ struct NsoFile {
 		// Check if we need to manually add the known segments (nothing was pointing to them,
 		// so they can go anywhere).
 		if (known_sections.size() != kNumSegment + 1) {
-			auto next_free = [&known_sections] (u16 start) -> u16 {
+			auto next_free = [&known_sections](u16 start) -> u16 {
 				for (u16 i = start + 1; i < SHN_LORESERVE; i++) {
 					if (!known_sections.count(i)) {
 						return i;
@@ -492,50 +643,9 @@ struct NsoFile {
 		// .shstrtab
 		shdrs_needed++;
 		// Assume the following will always be present: .dynstr, .dynsym, .dynamic, .rela.dyn
-		for (auto &name : {".dynstr", ".dynsym", ".dynamic", ".rela.dyn"}) {
+		for (auto &name : { ".dynstr", ".dynsym", ".dynamic", ".rela.dyn" }) {
 			shstrtab.AddString(name);
 			shdrs_needed++;
-		}
-
-		// Just used 1:1, don't need to translate to useful values
-		struct {
-			u64 rela;
-			u64 relasz;
-			u64 jmprel;
-			u64 pltrelsz;
-			u64 strtab;
-			u64 strsz;
-			u64 pltgot;
-			u64 hash;
-			u64 gnu_hash;
-			u64 init;
-			u64 fini;
-			u64 init_array;
-			u64 init_arraysz;
-			u64 fini_array;
-			u64 fini_arraysz;
-		} dyn_info{};
-		for (auto dyn = dynamic; dyn->d_tag; dyn++) {
-			#define DT_ASSIGN_U64(dt, var) \
-			case dt: dyn_info.var = dyn->d_un; break;
-			switch (dyn->d_tag) {
-			DT_ASSIGN_U64(DT_RELA, rela);
-			DT_ASSIGN_U64(DT_RELASZ, relasz);
-			DT_ASSIGN_U64(DT_JMPREL, jmprel);
-			DT_ASSIGN_U64(DT_PLTRELSZ, pltrelsz);
-			DT_ASSIGN_U64(DT_STRTAB, strtab);
-			DT_ASSIGN_U64(DT_STRSZ, strsz);
-			DT_ASSIGN_U64(DT_PLTGOT, pltgot);
-			DT_ASSIGN_U64(DT_HASH, hash);
-			DT_ASSIGN_U64(DT_GNU_HASH, gnu_hash);
-			DT_ASSIGN_U64(DT_INIT, init);
-			DT_ASSIGN_U64(DT_FINI, fini);
-			DT_ASSIGN_U64(DT_INIT_ARRAY, init_array);
-			DT_ASSIGN_U64(DT_INIT_ARRAYSZ, init_arraysz);
-			DT_ASSIGN_U64(DT_FINI_ARRAY, fini_array);
-			DT_ASSIGN_U64(DT_FINI_ARRAYSZ, fini_arraysz);
-			}
-			#undef DT_ASSIGN_U64
 		}
 
 		struct {
@@ -557,25 +667,7 @@ struct NsoFile {
 				present.name = true; \
 				shdrs_needed++; \
 			}
-		// Each plt slot is 4 instructions. The first entry fills 2 slots (resolving thunk).
-		u64 plt_addr = 0;
-		if (dyn_info.pltrelsz) {
-			const u32 plt_pattern[]{
-				0xa9bf7bf0, 0xd00004d0, 0xf9428a11, 0x91144210,
-				0xd61f0220, 0xd503201f, 0xd503201f, 0xd503201f
-			};
-			const u32 plt_mask[ARRAY_SIZE(plt_pattern)]{
-				0xffffffff, 0x00000000, 0xff000000, 0xff000000,
-				0xff000000, 0xffffffff, 0xffffffff, 0xffffffff
-			};
-			auto &text_seg = header.segments[kText];
-			auto found = static_cast<u8 *>(memmem_m(&image[text_seg.mem_offset],
-				text_seg.mem_size, plt_pattern, plt_mask, sizeof(plt_pattern)));
-			if (found) {
-				plt_addr = found - &image[0];
-			}
-		}
-		ALLOC_SHDR_IF(plt_addr, plt);
+		ALLOC_SHDR_IF(plt_info.addr, plt);
 		u64 jump_slot_addr_end = 0;
 		if (dyn_info.jmprel) {
 			for (size_t i = 0; i < dyn_info.pltrelsz / sizeof(Elf64_Rela); i++) {
@@ -590,7 +682,7 @@ struct NsoFile {
 		if (jump_slot_addr_end) {
 			u64 got_dynamic_ptr = reinterpret_cast<uintptr_t>(dynamic) - reinterpret_cast<uintptr_t>(&image[0]);
 			auto found = static_cast<u8 *>(memmem(&image[jump_slot_addr_end],
-				image.size()- jump_slot_addr_end, &got_dynamic_ptr, sizeof(got_dynamic_ptr)));
+				image.size() - jump_slot_addr_end, &got_dynamic_ptr, sizeof(got_dynamic_ptr)));
 			if (found) {
 				got_addr = found - &image[0];
 			}
@@ -666,7 +758,7 @@ struct NsoFile {
 			elf_size += seg.mem_size;
 		}
 		std::vector<u8> elf(elf_size);
-		
+
 		auto ehdr = reinterpret_cast<Elf64_Ehdr *>(&elf[0]);
 		ehdr->e_ident = { ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_NONE, 0 };
 		ehdr->e_type = ET_DYN;
@@ -894,16 +986,13 @@ struct NsoFile {
 
 		u32 plt_shndx = SHN_UNDEF;
 		if (present.plt) {
-			// Assume the plt exactly matches .rela.plt
-			u64 plt_entry_count = dyn_info.pltrelsz / sizeof(Elf64_Rela);
-			const u64 plt_entry_size = sizeof(u32) * 4;
 			shdr = {};
 			shdr.sh_name = shstrtab.GetOffset(".plt");
 			shdr.sh_type = SHT_PROGBITS;
 			shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
-			shdr.sh_addr = plt_addr;
+			shdr.sh_addr = plt_info.addr;
 			shdr.sh_offset = vaddr_to_foffset(shdr.sh_addr);
-			shdr.sh_size = plt_entry_size * 2 + plt_entry_size * plt_entry_count;
+			shdr.sh_size = plt_info.size;
 			shdr.sh_addralign = 0x10;
 			shdr.sh_entsize = 0x10;
 			plt_shndx = insert_shdr(shdr, true);
@@ -1101,13 +1190,37 @@ struct NsoFile {
 	}
 
 	FileType file_type{ kUnknown };
-	
+
 	NsoHeader header{};
 
 	std::vector<u8> image;
 	const Elf64_Dyn *dynamic{};
 	const Elf64_Nhdr *note{};
-	
+
+	struct {
+		u64 symtab;
+		u64 rela;
+		u64 relasz;
+		u64 jmprel;
+		u64 pltrelsz;
+		u64 strtab;
+		u64 strsz;
+		u64 pltgot;
+		u64 hash;
+		u64 gnu_hash;
+		u64 init;
+		u64 fini;
+		u64 init_array;
+		u64 init_arraysz;
+		u64 fini_array;
+		u64 fini_arraysz;
+	} dyn_info{};
+
+	struct {
+		u64 addr;
+		u64 size;
+	} plt_info;
+
 	struct {
 		u64 hdr_addr;
 		u64 hdr_size;
@@ -1144,7 +1257,7 @@ int main(int argc, char **argv) {
 
 	fs::path path(argv[1]);
 	if (fs::is_directory(path)) {
-		File::iter_files(path, [] (const fs::path& nx_path) {
+		File::iter_files(path, [](const fs::path& nx_path) {
 			NsoToElf(nx_path);
 		});
 	}

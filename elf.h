@@ -176,6 +176,14 @@ struct Elf64_Sym {
 #define STB_GLOBAL 1
 #define STB_WEAK   2
 
+#define STT_NOTYPE  0
+#define STT_OBJECT  1
+#define STT_FUNC    2
+#define STT_SECTION 3
+#define STT_FILE    4
+#define STT_COMMON  5
+#define STT_TLS     6
+
 struct Elf64_Rela {
 	u64 r_offset;
 	u64 r_info;
@@ -264,6 +272,7 @@ struct GnuBuildId {
 	Elf64_Nhdr header;
 	std::array<char, 4> owner;
 	union {
+		std::array<u8, 32> build_id_raw;
 		md5_digest build_id_md5;
 		sha1_digest build_id_sha1;
 	};
