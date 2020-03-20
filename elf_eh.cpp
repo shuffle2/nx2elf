@@ -22,7 +22,7 @@
 
 #define DW_EH_PE_indirect       0x80
 
-bool ElfEHInfo::MeasureFrame(const eh_frame_hdr *hdr, uintptr_t *eh_frame_ptr, size_t *eh_frame_len) {
+bool ElfEHInfo::MeasureFrame(const eh_frame_hdr *hdr, uintptr_t *eh_frame_ptr, u64 *eh_frame_len) {
 	if (hdr->version != 1) {
 		return false;
 	}

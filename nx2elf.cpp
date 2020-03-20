@@ -1,4 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
+#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
 
 #include <algorithm>
 #include <array>
@@ -1232,21 +1233,31 @@ const std::array<u8, 4> NsoFile::nso_magic{ { 'N', 'S', 'O', '0' } };
 const std::array<u8, 4> NsoFile::nro_magic{ { 'N', 'R', 'O', '0' } };
 const std::array<u8, 4> NsoFile::mod_magic{ { 'M', 'O', 'D', '0' } };
 
-static bool NsoToElf(const fs::path& path, bool verbose = false) {
-	NsoFile nso;
-	if (!nso.Load(path)) {
-		return false;
+extern "C" {
+
+#ifdef USE_DECLSPEC
+	__declspec(dllexport)
+#endif
+	bool NsoToElf(const fs::path& path, const fs::path& elf_path, bool verbose = false) {
+		NsoFile nso;
+		if (!nso.Load(path)) {
+			return false;
+		}
+		printf("%s:\n", path.string().c_str());
+		nso.Dump(verbose);
+		if (verbose) {
+			nso.DumpElfInfo();
+		}
+		bool rv = nso.WriteElf(elf_path);
+		puts("");
+		return rv;
 	}
-	printf("%s:\n", path.string().c_str());
-	nso.Dump(verbose);
-	if (verbose) {
-		nso.DumpElfInfo();
-	}
+}
+
+static bool NsoToElf_Internal(const fs::path& path, bool verbose = false) {
 	fs::path elf_path(path);
 	elf_path.replace_extension(".elf");
-	bool rv = nso.WriteElf(elf_path);
-	puts("");
-	return rv;
+	return NsoToElf(path, elf_path, verbose);
 }
 
 int main(int argc, char **argv) {
@@ -1258,11 +1269,11 @@ int main(int argc, char **argv) {
 	fs::path path(argv[1]);
 	if (fs::is_directory(path)) {
 		File::iter_files(path, [](const fs::path& nx_path) {
-			NsoToElf(nx_path);
+			NsoToElf_Internal(nx_path);
 		});
 	}
 	else {
-		NsoToElf(path);
+		NsoToElf_Internal(path);
 	}
 	return 0;
 }
