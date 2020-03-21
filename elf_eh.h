@@ -34,5 +34,5 @@ struct eh_fde_rel {
 };
 
 struct ElfEHInfo {
-	bool MeasureFrame(const eh_frame_hdr *hdr, uintptr_t *eh_frame_ptr, size_t *eh_frame_len);
+	bool MeasureFrame(const eh_frame_hdr *hdr, uintptr_t *eh_frame_ptr, u64 *eh_frame_len);
 };
