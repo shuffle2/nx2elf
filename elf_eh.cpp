@@ -32,6 +32,10 @@ bool ElfEHInfo::MeasureFrame(const eh_frame_hdr *hdr, uintptr_t *eh_frame_ptr, s
 		if (base == 0) {
 			base = (uintptr_t)buf;
 		}
+		if (enc == DW_EH_PE_omit) {
+			// XXX hack for "nonexistant" value
+			return (uintptr_t)0;
+		}
 		switch (enc & 0x70) {
 		case DW_EH_PE_absptr:
 			break;
@@ -64,7 +68,7 @@ bool ElfEHInfo::MeasureFrame(const eh_frame_hdr *hdr, uintptr_t *eh_frame_ptr, s
 		}
 		return val;
 	};
-	auto dw_fde_len = [&dw_decode](u32 *fde_len, const u8 *buf) {
+	auto dw_fde_len = [](u32 *fde_len, const u8 *buf) {
 		u32 len = READ_RAW(u32, buf);
 		if (len == 0xffffffff) {
 			return false;
@@ -76,6 +80,8 @@ bool ElfEHInfo::MeasureFrame(const eh_frame_hdr *hdr, uintptr_t *eh_frame_ptr, s
 
 	const u8 *ptr = (const u8 *)&hdr[1];
 	*eh_frame_ptr = dw_decode(hdr->eh_frame_ptr_enc, ptr);
+	// XXX hack: default to len(eh_frame) == 8 if fde_count == 0
+	*eh_frame_len = 8;
 	size_t fde_count = dw_decode(hdr->fde_count_enc, ptr);
 	uintptr_t max_ptr = 0;
 	for (size_t i = 0; i < fde_count; i++) {

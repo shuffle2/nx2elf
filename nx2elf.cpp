@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
-#include <experimental/filesystem>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -13,7 +13,7 @@
 #include "lz4.h"
 #include "types.h"
 
-namespace fs = std::experimental::filesystem;
+namespace fs = std::filesystem;
 
 namespace File {
 
@@ -35,7 +35,7 @@ static void iter_files(const fs::path& directory, std::function<void(const fs::p
 }
 
 static UniqueFile Open(const fs::path& path, const char *mode) {
-	return UniqueFile{ fopen(path.u8string().c_str(), mode) };
+	return UniqueFile{ fopen(path.string().c_str(), mode) };
 }
 
 static std::vector<u8> Read(const fs::path& path) {
@@ -405,7 +405,7 @@ struct NsoFile {
 			iter_dynsym([&](const Elf64_Sym& sym, u32) {
 				if (segments[kData].offset == 0 && ELF64_ST_TYPE(sym.st_info) == STT_SECTION &&
 					sym.st_shndx == seen_shndx[kData]) {
-					segments[kData].offset = sym.st_value;
+					segments[kData].offset = static_cast<u32>(sym.st_value);
 				}
 			});
 			if (segments[kData].offset == 0) {
