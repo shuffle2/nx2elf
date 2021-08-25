@@ -225,7 +225,7 @@ struct NsoFile {
 		int len = LZ4_decompress_safe(reinterpret_cast<const char *>(src),
 			reinterpret_cast<char *>(dst), src_len, dst_len);
 		if (len != dst_len)
-			printf("LZ4_decompress_safe: %8x (expected %8x)\n", len, dst_len);
+			printf("LZ4_decompress_safe: %d (expected %8x)\n", len, dst_len);
 		return len > 0;
 	}
 	bool ResolvePlt(void *base, size_t len) {
