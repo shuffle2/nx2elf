@@ -1,3 +1,5 @@
+#include <cstdio>
+
 #include "elf_eh.h"
 #include "types.h"
 
