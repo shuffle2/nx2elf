@@ -26,7 +26,7 @@
 
 bool ElfEHInfo::MeasureFrame(const eh_frame_hdr* hdr,
                              uintptr_t* eh_frame_ptr,
-                             size_t* eh_frame_len) {
+                             uint32_t* eh_frame_len) {
   if (hdr->version != 1) {
     return false;
   }

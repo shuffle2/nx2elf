@@ -169,6 +169,29 @@ struct Elf64_Sym {
   u64 st_size;
 };
 
+typedef struct {
+  u32      st_name;
+  u32      st_value;
+  u32      st_size;
+  u8       st_info;
+  u8       st_other;
+  u16      st_shndx;
+} Elf32_Sym;
+
+typedef struct {
+  s32 d_tag;
+  s32 d_un;
+} Elf32_Dyn;
+
+typedef struct {
+  u32    r_offset;
+  u32    r_info;
+  s32   r_addend;
+} Elf32_Rela;
+
+#define ELF32_R_SYM(x) ((x) >> 8)
+#define ELF32_R_TYPE(x) ((x) & 0xff)
+
 #define ELF64_ST_BIND(info) ((info) >> 4)
 #define ELF64_ST_TYPE(info) ((info)&0xf)
 #define ELF64_ST_INFO(bind, type) (((bind) << 4) + ((type)&0xf))
