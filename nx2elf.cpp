@@ -1195,10 +1195,10 @@ struct NsoFile {
         fputs("failed to insert new shdr for .symtab", stderr);
       }
 
-      // rewrite all offsets into plt_shndx
+      // rewrite all offsets into text_shndx
       for (size_t i = 0; i < symtab.size(); i++) {
         Elf32_Sym *sym = ((Elf32_Sym *) &elf[shdr.sh_offset]) + i;
-        if (i > 0) sym->st_shndx = plt_shndx;
+        if (i > 0) sym->st_shndx = 2;
       }
     }
 
