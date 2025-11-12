@@ -1,0 +1,72 @@
+name: CD
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            output: nx2elf
+          - os: windows-latest
+            output: x64/Release/nx2elf.exe
+    
+    steps:
+    - uses: actions/checkout@v5
+    
+    - name: Build on Linux/macOS
+      if: matrix.os != 'windows-latest'
+      run: |
+        make
+        
+    - name: Build on Windows
+      if: matrix.os == 'windows-latest'
+      uses: microsoft/setup-msbuild@v2
+      with:
+        msbuild-architecture: x64
+      
+    - name: Build with MSBuild on Windows
+      if: matrix.os == 'windows-latest'
+      run: |
+        msbuild nx2elf.sln /p:Configuration=Release /p:Platform=x64
+    
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: nx2elf-${{ matrix.os }}
+        path: ${{ matrix.output }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v5
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v6
+      with:
+        path: artifacts
+    
+    - name: Create Release
+      id: create_release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: Release ${{ github.ref_name }}
+        draft: false
+        prerelease: false
+        files: |
+          artifacts/nx2elf-ubuntu-latest/nx2elf
+          artifacts/nx2elf-windows-latest/x64/Release/nx2elf.exe
+          artifacts/nx2elf-macos-latest/nx2elf
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
