@@ -1,3 +1,6 @@
+[![CD](https://github.com/shuffle2/nx2elf/actions/workflows/cd.yml/badge.svg)](https://github.com/shuffle2/nx2elf/actions/workflows/cd.yml)
+![GitHub all releases](https://img.shields.io/github/downloads/shuffle2/nx2elf/total)
+
 # nx2elf
 Convert Nintendo Switch executable files to ELFs
 
