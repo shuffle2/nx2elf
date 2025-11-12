@@ -13,12 +13,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         include:
           - os: ubuntu-latest
             output: nx2elf
           - os: windows-latest
             output: x64/Release/nx2elf.exe
+          - os: macos-latest
+            output: nx2elf
     
     steps:
     - uses: actions/checkout@v5
