@@ -1,89 +1,93 @@
 name: CD
 
 on:
-  push:
-    branches: [ main, master ]
-    tags:
-      - 'v*'
-  pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:
+    push:
+        branches: [main, master]
+        tags:
+            - "v*"
+    pull_request:
+        branches: [main, master]
+    workflow_dispatch:
 
 jobs:
-  build:
-    name: Build (${{ matrix.os }} - ${{ matrix.arch }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            arch: x86_64
-            output: nx2elf
-            build_cmd: make
-          - os: macos-latest
-            arch: arm64
-            output: nx2elf
-            build_cmd: make
-          - os: windows-latest
-            arch: x64
-            output: x64/Release/nx2elf.exe
-            build_cmd: msbuild nx2elf.sln /p:Configuration=Release /p:Platform=x64
+    build:
+        name: Build (${{ matrix.os }} - ${{ matrix.arch }})
+        runs-on: ${{ matrix.os }}
+        strategy:
+            matrix:
+                include:
+                    - os: ubuntu-latest
+                      arch: x86_64
+                      output: nx2elf
+                      build_cmd: make
+                    - os: macos-latest
+                      arch: arm64
+                      output: nx2elf
+                      build_cmd: make
+                    - os: windows-latest
+                      arch: x64
+                      output: x64/Release/nx2elf.exe
+                      build_cmd: msbuild nx2elf.sln /p:Configuration=Release /p:Platform=x64
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v5
 
-      - name: Set up MSBuild (Windows only)
-        if: runner.os == 'Windows'
-        uses: microsoft/setup-msbuild@v2
-        with:
-          msbuild-architecture: x64
+            - name: Set up MSBuild (Windows only)
+              if: runner.os == 'Windows'
+              uses: microsoft/setup-msbuild@v2
+              with:
+                  msbuild-architecture: x64
 
-      - name: Set up build cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            build/
-            .gradle/
-            .cache/
-          key: build-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('**/Makefile', '**/*.sln', '**/*.cpp', '**/*.h') }}
+            - name: Set up build cache
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      build/
+                      .gradle/
+                      .cache/
+                  key: build-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('**/Makefile', '**/*.sln', '**/*.cpp', '**/*.h') }}
 
-      - name: Build project
-        run: ${{ matrix.build_cmd }}
+            - name: Build project
+              run: ${{ matrix.build_cmd }}
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v5
-        with:
-          name: nx2elf-${{ matrix.os }}-${{ matrix.arch }}
-          path: ${{ matrix.output }}
+            - name: Upload artifact
+              uses: actions/upload-artifact@v5
+              with:
+                  name: nx2elf-${{ matrix.os }}-${{ matrix.arch }}
+                  path: ${{ matrix.output }}
 
-  release:
-    name: Release Artifacts
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    release:
+        name: Release Artifacts
+        needs: build
+        if: startsWith(github.ref, 'refs/tags/v')
+        runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v5
 
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v6
-        with:
-          path: artifacts
+            - name: Download all build artifacts
+              uses: actions/download-artifact@v6
+              with:
+                  path: artifacts
 
-      - name: List downloaded artifacts
-        run: ls -R artifacts
+            - name: Create ZIPs for each binary
+              run: |
+                  cd artifacts
+                  zip -j nx2elf-linux-x86_64.zip nx2elf-ubuntu-latest-x86_64/nx2elf
+                  zip -j nx2elf-macos-arm64.zip nx2elf-macos-latest-arm64/nx2elf
+                  zip -j nx2elf-windows-x64.zip nx2elf-windows-latest-x64/nx2elf.exe
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: "Release ${{ github.ref_name }}"
-          draft: false
-          prerelease: false
-          files: |
-            artifacts/nx2elf-ubuntu-latest-x86_64/nx2elf
-            artifacts/nx2elf-windows-latest-x64/nx2elf.exe
-            artifacts/nx2elf-macos-latest-arm64/nx2elf
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            - name: List ZIPs
+              run: ls -R artifacts
+
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  name: "Release ${{ github.ref_name }}"
+                  draft: false
+                  prerelease: false
+                  files: artifacts/*.zip
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
