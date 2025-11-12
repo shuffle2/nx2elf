@@ -1,75 +1,89 @@
-name: CD
+name: Continuous Deployment
 
 on:
   push:
     branches: [ main, master ]
-    tags: [ 'v*' ]
+    tags:
+      - 'v*'
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
   build:
+    name: Build (${{ matrix.os }} - ${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         include:
           - os: ubuntu-latest
+            arch: x86_64
             output: nx2elf
-          - os: windows-latest
-            output: x64/Release/nx2elf.exe
+            build_cmd: make
           - os: macos-latest
+            arch: arm64
             output: nx2elf
-    
+            build_cmd: make
+          - os: windows-latest
+            arch: x64
+            output: x64/Release/nx2elf.exe
+            build_cmd: msbuild nx2elf.sln /p:Configuration=Release /p:Platform=x64
+
     steps:
-    - uses: actions/checkout@v5
-    
-    - name: Build on Linux/macOS
-      if: matrix.os != 'windows-latest'
-      run: |
-        make
-        
-    - name: Build on Windows
-      if: matrix.os == 'windows-latest'
-      uses: microsoft/setup-msbuild@v2
-      with:
-        msbuild-architecture: x64
-      
-    - name: Build with MSBuild on Windows
-      if: matrix.os == 'windows-latest'
-      run: |
-        msbuild nx2elf.sln /p:Configuration=Release /p:Platform=x64
-    
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v5
-      with:
-        name: nx2elf-${{ matrix.os }}
-        path: ${{ matrix.output }}
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up MSBuild (Windows only)
+        if: runner.os == 'Windows'
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      - name: Set up build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/
+            .gradle/
+            .cache/
+          key: build-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('**/Makefile', '**/*.sln', '**/*.cpp', '**/*.h') }}
+
+      - name: Build project
+        run: ${{ matrix.build_cmd }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: nx2elf-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ matrix.output }}
 
   release:
+    name: Release Artifacts
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    
+
     steps:
-    - uses: actions/checkout@v5
-    
-    - name: Download all artifacts
-      uses: actions/download-artifact@v6
-      with:
-        path: artifacts
-    
-    - name: Create Release
-      id: create_release
-      uses: softprops/action-gh-release@v2
-      with:
-        name: Release ${{ github.ref_name }}
-        draft: false
-        prerelease: false
-        files: |
-          artifacts/nx2elf-ubuntu-latest/nx2elf
-          artifacts/nx2elf-windows-latest/x64/Release/nx2elf.exe
-          artifacts/nx2elf-macos-latest/nx2elf
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: List downloaded artifacts
+        run: ls -R artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Release ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/nx2elf-ubuntu-latest-x86_64/nx2elf
+            artifacts/nx2elf-windows-latest-x64/x64/Release/nx2elf.exe
+            artifacts/nx2elf-macos-latest-arm64/nx2elf
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
