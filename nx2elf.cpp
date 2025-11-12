@@ -761,7 +761,7 @@ struct NsoFile {
     uintptr_t eh_frame_ptr;
     if (eh.MeasureFrame(
             reinterpret_cast<eh_frame_hdr*>(&image[eh_info.hdr_addr]),
-            &eh_frame_ptr, &eh_info.frame_size)) {
+            &eh_frame_ptr, reinterpret_cast<size_t*>(&eh_info.frame_size))) {
       eh_info.frame_addr =
           eh_info.hdr_addr + (eh_frame_ptr - reinterpret_cast<uintptr_t>(
                                                  &image[eh_info.hdr_addr]));

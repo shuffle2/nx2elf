@@ -3,3 +3,4 @@ x64/
 Debug/
 *.vcxproj.user
 nx2elf
+.vscode
