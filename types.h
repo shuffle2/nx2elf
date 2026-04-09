@@ -23,6 +23,7 @@ typedef std::array<u8, 32> sha256_digest;
 #define ALIGN_DOWN(x, align) ((x) & ~((align)-1))
 #define ALIGN_UP(x, align) ALIGN_DOWN((x) + ((align)-1), (align))
 
+#ifndef __APPLE__
 inline void* memmem(const void* haystack,
                     size_t haystack_len,
                     const void* needle,
@@ -37,6 +38,7 @@ inline void* memmem(const void* haystack,
   }
   return nullptr;
 }
+#endif
 
 inline int memcmp_m(const void* ptr1,
                     const void* ptr2,

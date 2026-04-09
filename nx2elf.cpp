@@ -8,6 +8,8 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <memory>
+#include <vector>
 #include "elf.h"
 #include "elf_eh.h"
 #include "lz4.h"
@@ -117,7 +119,7 @@ struct NsoFile {
     u8 magic[4];
     u32 field_4;
     u32 field_8;
-    u32 field_c;
+    u32 flags;
     SegmentHeader segments[kNumSegment];
     // value from .note, can be various lengths :/
     std::array<u8, 32> gnu_build_id;
@@ -162,36 +164,37 @@ struct NsoFile {
     // There is also a nss-name section
   };
   template <typename T>
-  char* FormatBytes(char* p, T d) {
+  static char* FormatBytes(char* p, char* end, T d) {
     for (auto& b : d)
-      p += sprintf(p, "%02x", b);
+      p += snprintf(p, end - p, "%02x", b);
     return p;
   }
   void Dump(bool verbose = false) {
     char msg[1024];
     char* p = msg;
+    char* end = msg + sizeof(msg);
     const char* idx2prot[kNumSegment] = {"r-x", "r--", "rw-"};
 
-#define FMT_FIELD(f) p += sprintf(p, #f ": %8x\n", header.f);
+#define FMT_FIELD(f) p += snprintf(p, end - p, #f ": %8x\n", header.f);
 
     if (verbose) {
       FMT_FIELD(field_4);
       FMT_FIELD(field_8);
-      FMT_FIELD(field_c);
+      FMT_FIELD(flags);
     }
 
-    p += sprintf(p, "gnu_build_id: ");
-    p = FormatBytes(p, header.gnu_build_id);
-    p += sprintf(p, "\n");
+    p += snprintf(p, end - p, "gnu_build_id: ");
+    p = FormatBytes(p, end, header.gnu_build_id);
+    p += snprintf(p, end - p, "\n");
 
-    p += sprintf(p, "         %-8s %-8s %-8s %-8s %-8s\n", "file off",
-                 "file len", "mem off", "mem len", "bss/algn");
+    p += snprintf(p, end - p, "         %-8s %-8s %-8s %-8s %-8s\n", "file off",
+                  "file len", "mem off", "mem len", "bss/algn");
     for (int i = 0; i < kNumSegment; i++) {
       auto& seg = header.segments[i];
       auto& file_size = header.segment_file_sizes[i];
-      p += sprintf(p, "%d [%-3s]: %8x %8x %8x %8x %8x\n", i, idx2prot[i],
-                   seg.file_offset, file_size, seg.mem_offset, seg.mem_size,
-                   seg.bss_align);
+      p += snprintf(p, end - p, "%d [%-3s]: %8x %8x %8x %8x %8x\n",
+                    i, idx2prot[i], seg.file_offset, file_size,
+                    seg.mem_offset, seg.mem_size, seg.bss_align);
     }
 
     if (verbose) {
@@ -199,17 +202,17 @@ struct NsoFile {
         FMT_FIELD(field_6c[i]);
     }
 
-    p += sprintf(p, ".rodata-relative:\n");
-    p += sprintf(p, "  .dynstr: %8x %8x\n", header.dynstr.offset,
-                 header.dynstr.size);
-    p += sprintf(p, "  .dynsym: %8x %8x\n", header.dynsym.offset,
-                 header.dynsym.size);
+    p += snprintf(p, end - p, ".rodata-relative:\n");
+    p += snprintf(p, end - p, "  .dynstr: %8x %8x\n", header.dynstr.offset,
+                  header.dynstr.size);
+    p += snprintf(p, end - p, "  .dynsym: %8x %8x\n", header.dynsym.offset,
+                  header.dynsym.size);
 
-    p += sprintf(p, "segment digests:\n");
+    p += snprintf(p, end - p, "segment digests:\n");
     for (int i = 0; i < kNumSegment; i++) {
-      p += sprintf(p, "%d [%-3s]: ", i, idx2prot[i]);
-      p = FormatBytes(p, header.segment_digests[i]);
-      p += sprintf(p, "\n");
+      p += snprintf(p, end - p, "%d [%-3s]: ", i, idx2prot[i]);
+      p = FormatBytes(p, end, header.segment_digests[i]);
+      p += snprintf(p, end - p, "\n");
     }
 
 #undef FMT_FIELD
@@ -264,10 +267,14 @@ struct NsoFile {
       for (int i = 0; i < kNumSegment; i++) {
         auto& seg = header.segments[i];
         auto& file_size = header.segment_file_sizes[i];
-        if (!Decompress(&image[seg.mem_offset], seg.mem_size,
-                        &file[seg.file_offset], file_size)) {
-          return false;
-        }
+				if ((header.flags & (1 << i)) != 0) {
+					if (!Decompress(&image[seg.mem_offset], seg.mem_size,
+						&file[seg.file_offset], file_size)) {
+						return false;
+					}
+				} else {
+					std::memcpy(&image[seg.mem_offset], &file[seg.file_offset], file_size);
+				}
       }
       file_type = kNso;
     } else if (file.size() >= nro_offset + sizeof(NroHeader) &&
@@ -562,6 +569,26 @@ struct NsoFile {
       func(*sym, i);
     }
   }
+  bool WriteUncompressedNso(const fs::path& path) {
+    NsoHeader new_header = header;
+    // clear compression flags
+    new_header.flags &= 0xf8;
+    // fix segment offsets and size
+    for (int i = 0; i < kNumSegment; i++) {
+      new_header.segments[i].file_offset = new_header.segments[i].mem_offset + sizeof(NsoHeader);
+      new_header.segment_file_sizes[i] = new_header.segments[i].mem_size;
+    }
+    new_header.segments[kText].bss_align = 0x100;
+    new_header.segments[kRodata].bss_align = 0;
+
+    u32 image_size = new_header.segments[kData].mem_offset + 
+                     new_header.segments[kData].mem_size;
+    std::vector<u8> data = std::vector<u8>(sizeof(NsoHeader) + image_size);
+    memcpy(data.data(), &new_header, sizeof(NsoHeader));
+    memcpy(data.data() + sizeof(NsoHeader), image.data(), image_size);
+    File::Write(path, data);
+    return true;
+  }
   bool WriteElf(const fs::path& path) {
     StringTable shstrtab;
     shstrtab.AddString(".shstrtab");
@@ -765,8 +792,10 @@ struct NsoFile {
       eh_info.frame_addr =
           eh_info.hdr_addr + (eh_frame_ptr - reinterpret_cast<uintptr_t>(
                                                  &image[eh_info.hdr_addr]));
-      // XXX the alignment of sizes is a fudge...
-      eh_info.hdr_size = ALIGN_UP(eh_info.hdr_size, 0x10);
+      // Clamp hdr_size so it doesn't overlap with frame
+      eh_info.hdr_size =
+          std::min((u64)ALIGN_UP(eh_info.hdr_size, 0x10),
+                   eh_info.frame_addr - eh_info.hdr_addr);
       eh_info.frame_size = ALIGN_UP(eh_info.frame_size, 0x10);
       present.eh = true;
       // Account for .eh_frame_hdr and .eh_frame
@@ -872,7 +901,7 @@ struct NsoFile {
           phdr->p_align = 1;
         } else {
           phdr->p_memsz = seg.mem_size;
-          phdr->p_align = seg.bss_align;
+          phdr->p_align = std::max(1u, seg.bss_align);
         }
 
         memcpy(&elf[0] + phdr->p_offset, &image[seg.mem_offset],
@@ -882,6 +911,13 @@ struct NsoFile {
         for (auto& known_section : known_sections) {
           if (known_section.second.sh_addr == phdr->p_vaddr) {
             known_section.second.sh_offset = phdr->p_offset;
+          }
+          // fixup .bss offset to point past end of data segment file content
+          if (known_section.second.sh_type == SHT_NOBITS &&
+              known_section.second.sh_addr ==
+                  phdr->p_vaddr + phdr->p_filesz) {
+            known_section.second.sh_offset =
+                phdr->p_offset + phdr->p_filesz;
           }
         }
 
@@ -916,10 +952,16 @@ struct NsoFile {
     // otherwise work fine by being only in the dynamic section, must also
     // have section headers...
     auto shdrs = reinterpret_cast<Elf64_Shdr*>(&elf[0] + ehdr->e_shoff);
-    // Insert sections for which section index was known
+    // Insert sections for which section index was known.
+    // Only emit .bss (SHT_NOBITS) - skip .text/.rodata/.data (SHT_PROGBITS)
+    // which span entire segments and overlap with specific sub-sections,
+    // causing IDA to reject the overlapping sub-sections (e.g. .dynsym).
+    // The program headers already define the loadable segments.
     for (auto& known_section : known_sections) {
-      auto shdr = &shdrs[known_section.first];
-      *shdr = known_section.second;
+      if (known_section.second.sh_type == SHT_NOBITS) {
+        auto shdr = &shdrs[known_section.first];
+        *shdr = known_section.second;
+      }
     }
     // Insert other handy sections at an available section index
     auto insert_shdr = [&](const Elf64_Shdr& shdr,
@@ -1299,7 +1341,7 @@ const std::array<u8, 4> NsoFile::nso_magic{{'N', 'S', 'O', '0'}};
 const std::array<u8, 4> NsoFile::nro_magic{{'N', 'R', 'O', '0'}};
 const std::array<u8, 4> NsoFile::mod_magic{{'M', 'O', 'D', '0'}};
 
-static bool NsoToElf(const fs::path& path, bool verbose = false) {
+static bool NsoToElf(const fs::path& path, const char* elf_path, const char* uncompressed_path, bool verbose = false) {
   NsoFile nso;
   if (!nso.Load(path)) {
     return false;
@@ -1309,24 +1351,55 @@ static bool NsoToElf(const fs::path& path, bool verbose = false) {
   if (verbose) {
     nso.DumpElfInfo();
   }
-  fs::path elf_path(path);
-  elf_path.replace_extension(".elf");
-  bool rv = nso.WriteElf(elf_path);
-  puts("");
-  return rv;
+
+  bool success = true;
+
+  // Default: write .elf next to the input file
+  fs::path elf_output;
+  if (elf_path) {
+    elf_output = elf_path;
+  } else {
+    elf_output = path;
+    elf_output.replace_extension(".elf");
+  }
+  success &= nso.WriteElf(elf_output);
+
+  if (uncompressed_path)
+    success &= nso.WriteUncompressedNso(fs::path(uncompressed_path));
+
+  return success;
 }
 
 int main(int argc, char** argv) {
-  if (argc < 2 || !fs::exists(argv[1])) {
-    fputs("file or directory", stderr);
+  const char* usage = "Usage: nx2elf <file or directory> [--export-uncompressed <path>] [--export-elf <path>]\n";
+
+  if (argc < 2) {
+    fputs(usage, stderr);
     return 1;
   }
 
-  fs::path path(argv[1]);
+  const char* input_path = nullptr;
+  const char* elf_path = nullptr;
+  const char* uncompressed_path = nullptr;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--export-elf") == 0) {
+      elf_path = argv[++i];
+    } else if (strcmp(argv[i], "--export-uncompressed") == 0) {
+      uncompressed_path = argv[++i];
+    } else if (input_path == nullptr) {
+      input_path = argv[i];
+    } else {
+      fprintf(stderr, "Unknown option: %s\n", argv[i]);
+      fputs(usage, stderr);
+      return 1;
+    }
+  }
+
+  fs::path path(input_path);
   if (fs::is_directory(path)) {
-    File::iter_files(path, [](const fs::path& nx_path) { NsoToElf(nx_path); });
+    File::iter_files(path, [elf_path, uncompressed_path](const fs::path& nx_path) { NsoToElf(nx_path, elf_path, uncompressed_path); });
   } else {
-    NsoToElf(path);
+    NsoToElf(path, elf_path, uncompressed_path);
   }
   return 0;
 }
