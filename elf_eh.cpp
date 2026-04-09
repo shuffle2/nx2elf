@@ -2,6 +2,7 @@
 
 #include "elf_eh.h"
 #include "types.h"
+#include <cstdio>
 
 #define DW_EH_PE_absptr 0x00
 #define DW_EH_PE_omit 0xff
@@ -26,7 +27,7 @@
 
 bool ElfEHInfo::MeasureFrame(const eh_frame_hdr* hdr,
                              uintptr_t* eh_frame_ptr,
-                             size_t* eh_frame_len) {
+                             u64* eh_frame_len) {
   if (hdr->version != 1) {
     return false;
   }
