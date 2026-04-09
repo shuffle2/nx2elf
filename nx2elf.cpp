@@ -953,15 +953,9 @@ struct NsoFile {
     // have section headers...
     auto shdrs = reinterpret_cast<Elf64_Shdr*>(&elf[0] + ehdr->e_shoff);
     // Insert sections for which section index was known.
-    // Only emit .bss (SHT_NOBITS) - skip .text/.rodata/.data (SHT_PROGBITS)
-    // which span entire segments and overlap with specific sub-sections,
-    // causing IDA to reject the overlapping sub-sections (e.g. .dynsym).
-    // The program headers already define the loadable segments.
     for (auto& known_section : known_sections) {
-      if (known_section.second.sh_type == SHT_NOBITS) {
-        auto shdr = &shdrs[known_section.first];
-        *shdr = known_section.second;
-      }
+      auto shdr = &shdrs[known_section.first];
+      *shdr = known_section.second;
     }
     // Insert other handy sections at an available section index
     auto insert_shdr = [&](const Elf64_Shdr& shdr,
@@ -1293,6 +1287,71 @@ struct NsoFile {
     ehdr->e_shstrndx = insert_shdr(shdr);
     if (ehdr->e_shstrndx == SHN_UNDEF) {
       fputs("failed to insert new shdr for .shstrtab", stderr);
+    }
+
+    // Trim broad segment sections (.text, .rodata, .data) so they don't
+    // overlap with the more specific sub-sections inserted above. IDA rejects
+    // overlapping sections, while GDB needs these sections to exist.
+    for (auto& [known_idx, _] : known_sections) {
+      auto& ks = shdrs[known_idx];
+      if (ks.sh_type != SHT_PROGBITS)
+        continue;
+
+      u64 ks_start = ks.sh_addr;
+      u64 ks_end = ks.sh_addr + ks.sh_size;
+
+      // Collect sub-sections that overlap with this broad section
+      struct Range {
+        u64 start, end;
+      };
+      std::vector<Range> subs;
+      for (u32 i = 1; i < num_shdrs; i++) {
+        if (i == known_idx)
+          continue;
+        auto& sub = shdrs[i];
+        if (sub.sh_type == SHT_NULL || sub.sh_size == 0)
+          continue;
+        u64 sub_start = sub.sh_addr;
+        u64 sub_end = sub.sh_addr + sub.sh_size;
+        if (sub_start < ks_end && sub_end > ks_start) {
+          subs.push_back({sub_start, sub_end});
+        }
+      }
+
+      if (subs.empty())
+        continue;
+
+      std::sort(subs.begin(), subs.end(),
+                [](const Range& a, const Range& b) {
+                  return a.start < b.start;
+                });
+
+      // Find the largest contiguous gap not covered by any sub-section
+      u64 best_start = ks_start, best_end = ks_start;
+      u64 gap_start = ks_start;
+      for (auto& sub : subs) {
+        if (sub.start > gap_start) {
+          if (sub.start - gap_start > best_end - best_start) {
+            best_start = gap_start;
+            best_end = sub.start;
+          }
+        }
+        if (sub.end > gap_start)
+          gap_start = sub.end;
+      }
+      // Check trailing gap after all sub-sections
+      if (ks_end > gap_start && ks_end - gap_start > best_end - best_start) {
+        best_start = gap_start;
+        best_end = ks_end;
+      }
+
+      ks.sh_addr = best_start;
+      ks.sh_size = best_end - best_start;
+      ks.sh_offset = vaddr_to_foffset(best_start);
+      // Trimmed boundaries may not satisfy the original alignment, and the
+      // ELF spec requires sh_addr % sh_addralign == 0.
+      if (ks.sh_addralign > 1 && ks.sh_addr % ks.sh_addralign != 0)
+        ks.sh_addralign = 1;
     }
 
     return File::Write(path, elf);
