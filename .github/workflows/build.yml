@@ -1,0 +1,36 @@
+name: build
+
+on: [push, pull_request]
+
+jobs:
+  cmake:
+    # Skip building pull requests from the same repository
+    if: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-2022]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        run: cmake --build build --config Release --target package
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nx2elf-${{ matrix.os }}
+          path: build/nx2elf-*.zip
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          files: build/nx2elf-*.zip
