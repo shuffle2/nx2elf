@@ -17,6 +17,45 @@
 
 namespace fs = std::filesystem;
 
+// ELF traits for templating 32-bit vs 64-bit ELF output
+struct ElfTraits64 {
+  using Ehdr = Elf64_Ehdr;
+  using Phdr = Elf64_Phdr;
+  using Shdr = Elf64_Shdr;
+  using Sym = Elf64_Sym;
+  using Dyn = Elf64_Dyn;
+  using Reloc = Elf64_Rela;
+  using Addr = u64;
+  static constexpr u8 elf_class = ELFCLASS64;
+  static constexpr u16 machine = EM_AARCH64;
+  static constexpr u32 e_flags = 0;
+  static constexpr u32 R_JUMP_SLOT = R_AARCH64_JUMP_SLOT;
+  static constexpr u32 R_GLOB_DAT = R_AARCH64_GLOB_DAT;
+  static constexpr u32 rel_shtype = SHT_RELA;
+  static constexpr const char* rel_dyn_name = ".rela.dyn";
+  static constexpr const char* rel_plt_name = ".rela.plt";
+  static u32 R_TYPE(u64 info) { return ELF64_R_TYPE(info); }
+};
+
+struct ElfTraits32 {
+  using Ehdr = Elf32_Ehdr;
+  using Phdr = Elf32_Phdr;
+  using Shdr = Elf32_Shdr;
+  using Sym = Elf32_Sym;
+  using Dyn = Elf32_Dyn;
+  using Reloc = Elf32_Rel;
+  using Addr = u32;
+  static constexpr u8 elf_class = ELFCLASS32;
+  static constexpr u16 machine = EM_ARM;
+  static constexpr u32 e_flags = EF_ARM_ABI_VER5;
+  static constexpr u32 R_JUMP_SLOT = R_ARM_JUMP_SLOT;
+  static constexpr u32 R_GLOB_DAT = R_ARM_GLOB_DAT;
+  static constexpr u32 rel_shtype = SHT_REL;
+  static constexpr const char* rel_dyn_name = ".rel.dyn";
+  static constexpr const char* rel_plt_name = ".rel.plt";
+  static u32 R_TYPE(u32 info) { return ELF32_R_TYPE(info); }
+};
+
 namespace File {
 
 struct FileDeleter {
@@ -228,9 +267,11 @@ struct NsoFile {
     return len > 0;
   }
   bool ResolvePlt(void* base, size_t len) {
-    // Each plt slot is 4 instructions. The first entry fills 2 slots (resolving
-    // thunk).
-    if (dyn_info.pltrelsz) {
+    if (!dyn_info.pltrelsz)
+      return false;
+
+    if (is_64bit) {
+      // AArch64 PLT: each slot is 4 instructions. First entry fills 2 slots.
       const u32 plt_pattern[]{0xa9bf7bf0, 0xd00004d0, 0xf9428a11, 0x91144210,
                               0xd61f0220, 0xd503201f, 0xd503201f, 0xd503201f};
       const u32 plt_mask[ARRAY_SIZE(plt_pattern)]{
@@ -240,10 +281,25 @@ struct NsoFile {
           memmem_m(base, len, plt_pattern, plt_mask, sizeof(plt_pattern)));
       if (found) {
         plt_info.addr = found - &image[0];
-        // Assume the plt exactly matches .rela.plt
         u64 plt_entry_count = dyn_info.pltrelsz / sizeof(Elf64_Rela);
         const u64 plt_entry_size = sizeof(u32) * 4;
         plt_info.size = plt_entry_size * 2 + plt_entry_size * plt_entry_count;
+        return true;
+      }
+    } else {
+      // ARM32 PLT stub: push {lr}; ldr lr, [pc, #4]; add lr, pc, lr; ldr pc, [lr, #8]!
+      const u32 plt_pattern[]{0xe52de004, 0xe59fe004, 0xe08fe00e, 0xe5bef008};
+      const u32 plt_mask[ARRAY_SIZE(plt_pattern)]{
+          0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
+      auto found = static_cast<u8*>(
+          memmem_m(base, len, plt_pattern, plt_mask, sizeof(plt_pattern)));
+      if (found) {
+        plt_info.addr = found - &image[0];
+        // ARM32 PLT: stub is 5 words (20 bytes), each entry is 3 words (12 bytes)
+        u64 plt_entry_count = dyn_info.pltrelsz / sizeof(Elf32_Rel);
+        const u64 plt_stub_size = sizeof(u32) * 5;
+        const u64 plt_entry_size = sizeof(u32) * 3;
+        plt_info.size = plt_stub_size + plt_entry_size * plt_entry_count;
         return true;
       }
     }
@@ -349,7 +405,33 @@ struct NsoFile {
       return static_cast<u32>(offset);
     };
 
-    dynamic = reinterpret_cast<Elf64_Dyn*>(mod_base + mod->dynamic_offset);
+    // Detect 32-bit vs 64-bit from dynamic section layout.
+    // For 64-bit, each Elf64_Dyn is {u64 d_tag, u64 d_un} = 16 bytes.
+    // For 32-bit, each Elf32_Dyn is {u32 d_tag, u32 d_un} = 8 bytes.
+    // Valid d_tag values are small, so for 64-bit the upper 32 bits of d_tag are 0.
+    // For 32-bit, the second u32 is d_un (typically a non-zero address).
+    auto dyn_ptr = mod_base + mod->dynamic_offset;
+    dynamic_offset = static_cast<u32>(dyn_ptr - &image[0]);
+    auto dyn_words = reinterpret_cast<u32*>(dyn_ptr);
+    is_64bit = (dyn_words[1] == 0);
+
+    if (is_64bit) {
+      dynamic = reinterpret_cast<Elf64_Dyn*>(dyn_ptr);
+      dynamic_count = 0;
+      for (auto dyn = dynamic; ; dyn++) {
+        dynamic_count++;
+        if (dyn->d_tag == DT_NULL) break;
+      }
+    } else {
+      auto dyn32 = reinterpret_cast<Elf32_Dyn*>(dyn_ptr);
+      for (auto d = dyn32; ; d++) {
+        dynamic_widened.push_back({d->d_tag, d->d_un});
+        if (d->d_tag == DT_NULL) break;
+      }
+      dynamic_count = static_cast<u32>(dynamic_widened.size());
+      dynamic = dynamic_widened.data();
+    }
+
     for (auto dyn = dynamic; dyn->d_tag; dyn++) {
 #define DT_ASSIGN_U64(dt, var) \
   case dt:                     \
@@ -359,6 +441,8 @@ struct NsoFile {
         DT_ASSIGN_U64(DT_SYMTAB, symtab);
         DT_ASSIGN_U64(DT_RELA, rela);
         DT_ASSIGN_U64(DT_RELASZ, relasz);
+        DT_ASSIGN_U64(DT_REL, rela);
+        DT_ASSIGN_U64(DT_RELSZ, relasz);
         DT_ASSIGN_U64(DT_JMPREL, jmprel);
         DT_ASSIGN_U64(DT_PLTRELSZ, pltrelsz);
         DT_ASSIGN_U64(DT_STRTAB, strtab);
@@ -397,6 +481,11 @@ struct NsoFile {
         return false;
       }
       // Need this up-front to be able to iter_dynsym
+      header.dynstr.offset =
+          static_cast<u32>(dyn_info.strtab - header.segments[kRodata].mem_offset);
+      header.dynstr.size = static_cast<u32>(dyn_info.strsz);
+      header.dynsym.offset =
+          static_cast<u32>(dyn_info.symtab - header.segments[kRodata].mem_offset);
       header.dynsym.size = static_cast<u32>(dyn_info.strtab - dyn_info.symtab);
       // yet another dirty hack. relies on all sections having at least
       // one symbol pointing into them, and a section symbol existing for .data
@@ -509,47 +598,41 @@ struct NsoFile {
   }
   void DumpElfInfo() {
     puts("dynamic:");
-    struct {
-      Elf64_Rela* rela;
-      u64 num_rela;
-      Elf64_Rela* jmprel;
-      u64 num_jmprel;
-    } rela_info;
     for (auto dyn = dynamic; dyn->d_tag; dyn++) {
       printf("%16" PRIx64 " %16" PRIx64 "\n", dyn->d_tag, dyn->d_un);
-
-#define DT_ASSIGN_PTR(dt, var, x)                                   \
-  case dt:                                                          \
-    rela_info.var = reinterpret_cast<decltype(rela_info.var)>((x)); \
-    break;
-#define DT_ASSIGN_U64(dt, var, x)                              \
-  case dt:                                                     \
-    rela_info.var = static_cast<decltype(rela_info.var)>((x)); \
-    break;
-
-      switch (dyn->d_tag) {
-        DT_ASSIGN_PTR(DT_RELA, rela, &image[dyn->d_un]);
-        DT_ASSIGN_U64(DT_RELASZ, num_rela, dyn->d_un / sizeof(*rela_info.rela));
-        DT_ASSIGN_PTR(DT_JMPREL, jmprel, &image[dyn->d_un]);
-        DT_ASSIGN_U64(DT_PLTRELSZ, num_jmprel,
-                      dyn->d_un / sizeof(*rela_info.jmprel));
+    }
+    if (is_64bit) {
+      puts("rela:");
+      auto num_rela = dyn_info.relasz / sizeof(Elf64_Rela);
+      for (size_t i = 0; i < num_rela; i++) {
+        auto& rela = reinterpret_cast<Elf64_Rela*>(&image[dyn_info.rela])[i];
+        printf("%16" PRIx64 " %8x %8x %16" PRIx64 "\n", rela.r_offset,
+               ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info),
+               rela.r_addend);
       }
-#undef DT_ASSIGN_U64
-#undef DT_ASSIGN_PTR
-    }
-    puts("rela:");
-    for (size_t i = 0; i < rela_info.num_rela; i++) {
-      auto& rela = rela_info.rela[i];
-      printf("%16" PRIx64 " %8x %8x %16" PRIx64 "\n", rela.r_offset,
-             ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info),
-             rela.r_addend);
-    }
-    puts("jmprel:");
-    for (size_t i = 0; i < rela_info.num_jmprel; i++) {
-      auto& rela = rela_info.jmprel[i];
-      printf("%16" PRIx64 " %8x %8x %16" PRIx64 "x\n", rela.r_offset,
-             ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info),
-             rela.r_addend);
+      puts("jmprel:");
+      auto num_jmprel = dyn_info.pltrelsz / sizeof(Elf64_Rela);
+      for (size_t i = 0; i < num_jmprel; i++) {
+        auto& rela = reinterpret_cast<Elf64_Rela*>(&image[dyn_info.jmprel])[i];
+        printf("%16" PRIx64 " %8x %8x %16" PRIx64 "\n", rela.r_offset,
+               ELF64_R_SYM(rela.r_info), ELF64_R_TYPE(rela.r_info),
+               rela.r_addend);
+      }
+    } else {
+      puts("rel:");
+      auto num_rel = dyn_info.relasz / sizeof(Elf32_Rel);
+      for (size_t i = 0; i < num_rel; i++) {
+        auto& rel = reinterpret_cast<Elf32_Rel*>(&image[dyn_info.rela])[i];
+        printf("%8x %8x %8x\n", rel.r_offset,
+               ELF32_R_SYM(rel.r_info), ELF32_R_TYPE(rel.r_info));
+      }
+      puts("jmprel:");
+      auto num_jmprel = dyn_info.pltrelsz / sizeof(Elf32_Rel);
+      for (size_t i = 0; i < num_jmprel; i++) {
+        auto& rel = reinterpret_cast<Elf32_Rel*>(&image[dyn_info.jmprel])[i];
+        printf("%8x %8x %8x\n", rel.r_offset,
+               ELF32_R_SYM(rel.r_info), ELF32_R_TYPE(rel.r_info));
+      }
     }
 
     auto rodata = &image[header.segments[kRodata].mem_offset];
@@ -563,10 +646,25 @@ struct NsoFile {
              sym.st_size, name);
     });
   }
+  // Iterate dynamic symbols, always widening to Elf64_Sym for uniform callback
   void iter_dynsym(std::function<void(const Elf64_Sym&, u32)> func) {
-    auto sym = reinterpret_cast<Elf64_Sym*>(&image[dyn_info.symtab]);
-    for (u32 i = 0; i < header.dynsym.size / sizeof(Elf64_Sym); i++, sym++) {
-      func(*sym, i);
+    if (is_64bit) {
+      auto sym = reinterpret_cast<Elf64_Sym*>(&image[dyn_info.symtab]);
+      for (u32 i = 0; i < header.dynsym.size / sizeof(Elf64_Sym); i++, sym++) {
+        func(*sym, i);
+      }
+    } else {
+      auto sym = reinterpret_cast<Elf32_Sym*>(&image[dyn_info.symtab]);
+      for (u32 i = 0; i < header.dynsym.size / sizeof(Elf32_Sym); i++, sym++) {
+        Elf64_Sym sym64{};
+        sym64.st_name = sym->st_name;
+        sym64.st_info = sym->st_info;
+        sym64.st_other = sym->st_other;
+        sym64.st_shndx = sym->st_shndx;
+        sym64.st_value = sym->st_value;
+        sym64.st_size = sym->st_size;
+        func(sym64, i);
+      }
     }
   }
   bool WriteUncompressedNso(const fs::path& path) {
@@ -581,7 +679,7 @@ struct NsoFile {
     new_header.segments[kText].bss_align = 0x100;
     new_header.segments[kRodata].bss_align = 0;
 
-    u32 image_size = new_header.segments[kData].mem_offset + 
+    u32 image_size = new_header.segments[kData].mem_offset +
                      new_header.segments[kData].mem_size;
     std::vector<u8> data = std::vector<u8>(sizeof(NsoHeader) + image_size);
     memcpy(data.data(), &new_header, sizeof(NsoHeader));
@@ -590,14 +688,30 @@ struct NsoFile {
     return true;
   }
   bool WriteElf(const fs::path& path) {
+    if (is_64bit)
+      return WriteElfImpl<ElfTraits64>(path);
+    else
+      return WriteElfImpl<ElfTraits32>(path);
+  }
+  template <typename T>
+  bool WriteElfImpl(const fs::path& path) {
+    using Ehdr = typename T::Ehdr;
+    using Phdr = typename T::Phdr;
+    using Shdr = typename T::Shdr;
+    using Sym = typename T::Sym;
+    using Dyn = typename T::Dyn;
+    using Reloc = typename T::Reloc;
+    using Addr = typename T::Addr;
+    constexpr size_t addr_size = sizeof(Addr);
+
     StringTable shstrtab;
     shstrtab.AddString(".shstrtab");
 
     // Profile sections based on dynsym
     u16 num_shdrs = 0;
-    std::unordered_map<u16, Elf64_Shdr> known_sections;
+    std::unordered_map<u16, Shdr> known_sections;
     auto vaddr_to_shdr = [&](u64 vaddr) {
-      Elf64_Shdr shdr{};
+      Shdr shdr{};
       for (int i = 0; i < kNumSegment; i++) {
         u64 location = vaddr;
         auto& seg = header.segments[i];
@@ -625,7 +739,7 @@ struct NsoFile {
           shdr.sh_name = shstrtab.GetOffset(name);
           shdr.sh_addr = seg.mem_offset;
           shdr.sh_size = seg.mem_size;
-          shdr.sh_addralign = sizeof(u64);
+          shdr.sh_addralign = addr_size;
         } else if (i == kData && (location >= seg_mem_end &&
                                   location <= seg_mem_end + seg.bss_align)) {
           // .bss
@@ -636,7 +750,7 @@ struct NsoFile {
           shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
           shdr.sh_addr = seg_mem_end;
           shdr.sh_size = seg.bss_align;
-          shdr.sh_addralign = sizeof(u64);
+          shdr.sh_addralign = addr_size;
         }
       }
       return shdr;
@@ -704,8 +818,8 @@ struct NsoFile {
     // .shstrtab
     shdrs_needed++;
     // Assume the following will always be present: .dynstr, .dynsym, .dynamic,
-    // .rela.dyn
-    for (auto& name : {".dynstr", ".dynsym", ".dynamic", ".rela.dyn"}) {
+    // .rel(a).dyn
+    for (auto& name : {".dynstr", ".dynsym", ".dynamic", T::rel_dyn_name}) {
       shstrtab.AddString(name);
       shdrs_needed++;
     }
@@ -732,19 +846,18 @@ struct NsoFile {
     ALLOC_SHDR_IF(plt_info.addr, plt);
     u64 jump_slot_addr_end = 0;
     if (dyn_info.jmprel) {
-      for (size_t i = 0; i < dyn_info.pltrelsz / sizeof(Elf64_Rela); i++) {
-        auto& rela = reinterpret_cast<Elf64_Rela*>(&image[dyn_info.jmprel])[i];
-        if (ELF64_R_TYPE(rela.r_info) == R_AARCH64_JUMP_SLOT) {
+      for (size_t i = 0; i < dyn_info.pltrelsz / sizeof(Reloc); i++) {
+        auto& rel = reinterpret_cast<Reloc*>(&image[dyn_info.jmprel])[i];
+        if (T::R_TYPE(rel.r_info) == T::R_JUMP_SLOT) {
           jump_slot_addr_end =
-              std::max(jump_slot_addr_end, rela.r_offset + sizeof(u64));
+              std::max(jump_slot_addr_end, (u64)rel.r_offset + addr_size);
         }
       }
     }
     ALLOC_SHDR_IF(jump_slot_addr_end && dyn_info.pltgot, got_plt);
     u64 got_addr = 0;
     if (jump_slot_addr_end) {
-      u64 got_dynamic_ptr = reinterpret_cast<uintptr_t>(dynamic) -
-                            reinterpret_cast<uintptr_t>(&image[0]);
+      Addr got_dynamic_ptr = static_cast<Addr>(dynamic_offset);
       auto found = static_cast<u8*>(
           memmem(&image[jump_slot_addr_end], image.size() - jump_slot_addr_end,
                  &got_dynamic_ptr, sizeof(got_dynamic_ptr)));
@@ -763,10 +876,21 @@ struct NsoFile {
     u32 init_ret_offset = 0;
     if (dyn_info.init) {
       auto init_ptr = reinterpret_cast<u32*>(&image[dyn_info.init]);
-      for (int i = 0;; i++) {
-        if (init_ptr[i] == 0xd65f03c0ul) {
-          init_ret_offset = (i + 1) * sizeof(u32);
-          break;
+      if (is_64bit) {
+        // AArch64: RET = 0xd65f03c0
+        for (int i = 0;; i++) {
+          if (init_ptr[i] == 0xd65f03c0ul) {
+            init_ret_offset = (i + 1) * sizeof(u32);
+            break;
+          }
+        }
+      } else {
+        // ARM32: BX LR = 0xe12fff1e or MOV PC, LR = 0xe1a0f00e
+        for (int i = 0; i < 0x100; i++) {
+          if (init_ptr[i] == 0xe12fff1eul || init_ptr[i] == 0xe1a0f00eul) {
+            init_ret_offset = (i + 1) * sizeof(u32);
+            break;
+          }
         }
       }
       ALLOC_SHDR_IF(init_ret_offset, init);
@@ -775,9 +899,18 @@ struct NsoFile {
     if (dyn_info.fini) {
       auto fini_ptr = reinterpret_cast<u32*>(&image[dyn_info.fini]);
       for (int i = 0; i < 0x20; i++) {
-        if ((fini_ptr[i] & 0xff000000ul) == 0x14000000ul) {
-          fini_branch_offset = (i + 1) * sizeof(u32);
-          break;
+        if (is_64bit) {
+          // AArch64: B = 0x14xxxxxx
+          if ((fini_ptr[i] & 0xff000000ul) == 0x14000000ul) {
+            fini_branch_offset = (i + 1) * sizeof(u32);
+            break;
+          }
+        } else {
+          // ARM32: B = 0xeaxxxxxx (always condition)
+          if ((fini_ptr[i] & 0xff000000ul) == 0xea000000ul) {
+            fini_branch_offset = (i + 1) * sizeof(u32);
+            break;
+          }
         }
       }
       ALLOC_SHDR_IF(fini_branch_offset, fini);
@@ -811,7 +944,7 @@ struct NsoFile {
     if (present.got_plt)
       shstrtab.AddString(".got.plt");
     if (present.rela_plt)
-      shstrtab.AddString(".rela.plt");
+      shstrtab.AddString(T::rel_plt_name);
     if (present.hash)
       shstrtab.AddString(".hash");
     if (present.gnu_hash)
@@ -835,33 +968,33 @@ struct NsoFile {
     // Add dynamic and EH segments
     u16 num_phdrs = kNumSegment + 2;
 
-    size_t elf_size = sizeof(Elf64_Ehdr) + sizeof(Elf64_Phdr) * num_phdrs +
-                      sizeof(Elf64_Shdr) * num_shdrs;
+    size_t elf_size = sizeof(Ehdr) + sizeof(Phdr) * num_phdrs +
+                      sizeof(Shdr) * num_shdrs;
     elf_size += shstrtab.size;
     for (auto& seg : header.segments) {
       elf_size += seg.mem_size;
     }
     std::vector<u8> elf(elf_size);
 
-    auto ehdr = reinterpret_cast<Elf64_Ehdr*>(&elf[0]);
-    ehdr->e_ident = {ELF_MAGIC,  ELFCLASS64,    ELFDATA2LSB,
+    auto ehdr = reinterpret_cast<Ehdr*>(&elf[0]);
+    ehdr->e_ident = {ELF_MAGIC,  T::elf_class,  ELFDATA2LSB,
                      EV_CURRENT, ELFOSABI_NONE, 0};
     ehdr->e_type = ET_DYN;
-    ehdr->e_machine = EM_AARCH64;
+    ehdr->e_machine = T::machine;
     ehdr->e_version = EV_CURRENT;
-    ehdr->e_ehsize = sizeof(Elf64_Ehdr);
-    ehdr->e_flags = 0;
+    ehdr->e_ehsize = sizeof(Ehdr);
+    ehdr->e_flags = T::e_flags;
     ehdr->e_entry = header.segments[kText].mem_offset;
     ehdr->e_phoff = ehdr->e_ehsize;
-    ehdr->e_phentsize = sizeof(Elf64_Phdr);
+    ehdr->e_phentsize = sizeof(Phdr);
     ehdr->e_phnum = num_phdrs;
     ehdr->e_shoff = ehdr->e_phoff + ehdr->e_phentsize * ehdr->e_phnum;
-    ehdr->e_shentsize = sizeof(Elf64_Shdr);
+    ehdr->e_shentsize = sizeof(Shdr);
     ehdr->e_shnum = num_shdrs;
     ehdr->e_shstrndx = SHN_UNDEF;
 
     // IDA only _needs_ phdrs and dynamic phdr to give good results
-    auto phdrs = reinterpret_cast<Elf64_Phdr*>(&elf[0] + ehdr->e_phoff);
+    auto phdrs = reinterpret_cast<Phdr*>(&elf[0] + ehdr->e_phoff);
 
     auto vaddr_to_foffset = [&](u64 vaddr) -> u64 {
       for (size_t i = 0; i < kNumSegment; i++) {
@@ -925,15 +1058,10 @@ struct NsoFile {
       } else if (i == kData + 1) {
         phdr->p_type = PT_DYNAMIC;
         phdr->p_flags = PF_R | PF_W;
-        phdr->p_vaddr = phdr->p_paddr = reinterpret_cast<uintptr_t>(dynamic) -
-                                        reinterpret_cast<uintptr_t>(&image[0]);
+        phdr->p_vaddr = phdr->p_paddr = dynamic_offset;
         phdr->p_offset = vaddr_to_foffset(phdr->p_vaddr);
-        size_t dyn_size = sizeof(Elf64_Dyn);
-        for (auto dyn = dynamic; dyn->d_tag; dyn++) {
-          dyn_size += sizeof(Elf64_Dyn);
-        }
-        phdr->p_filesz = phdr->p_memsz = dyn_size;
-        phdr->p_align = sizeof(u64);
+        phdr->p_filesz = phdr->p_memsz = dynamic_count * sizeof(Dyn);
+        phdr->p_align = addr_size;
       } else if (i == kData + 2) {
         // Too bad ida doesn't fucking use it!
         phdr->p_type = PT_GNU_EH_FRAME;
@@ -951,14 +1079,14 @@ struct NsoFile {
     // there, but once SHT_DYNAMIC is added, then many entries which would
     // otherwise work fine by being only in the dynamic section, must also
     // have section headers...
-    auto shdrs = reinterpret_cast<Elf64_Shdr*>(&elf[0] + ehdr->e_shoff);
+    auto shdrs = reinterpret_cast<Shdr*>(&elf[0] + ehdr->e_shoff);
     // Insert sections for which section index was known.
     for (auto& known_section : known_sections) {
       auto shdr = &shdrs[known_section.first];
       *shdr = known_section.second;
     }
     // Insert other handy sections at an available section index
-    auto insert_shdr = [&](const Elf64_Shdr& shdr,
+    auto insert_shdr = [&](const Shdr& shdr,
                            bool ordered = false) -> u32 {
       u32 start = 1;
       // This is basically a hack to convince ida not to delete segments
@@ -982,15 +1110,15 @@ struct NsoFile {
       // location
       if (ordered && start != 1) {
         fprintf(stderr,
-                "warning: failed to meet ordering for sh_addr %16" PRIx64 "\n",
-                shdr.sh_addr);
+                "warning: failed to meet ordering for sh_addr %" PRIx64 "\n",
+                (u64)shdr.sh_addr);
         start = 1;
         goto retry;
       }
       return SHN_UNDEF;
     };
 
-    Elf64_Shdr shdr;
+    Shdr shdr;
 
     if (present.init) {
       shdr = {};
@@ -1048,8 +1176,8 @@ struct NsoFile {
     shdr.sh_size = header.dynsym.size;
     shdr.sh_link = dynstr_shndx;
     shdr.sh_info = last_local_dynsym_index + 1;
-    shdr.sh_addralign = sizeof(u64);
-    shdr.sh_entsize = sizeof(Elf64_Sym);
+    shdr.sh_addralign = addr_size;
+    shdr.sh_entsize = sizeof(Sym);
     u32 dynsym_shndx = insert_shdr(shdr);
     if (dynsym_shndx == SHN_UNDEF) {
       fputs("failed to insert new shdr for .dynsym", stderr);
@@ -1065,23 +1193,23 @@ struct NsoFile {
     shdr.sh_size = dyn_phdr->p_filesz;
     shdr.sh_link = dynstr_shndx;
     shdr.sh_addralign = dyn_phdr->p_align;
-    shdr.sh_entsize = sizeof(Elf64_Dyn);
+    shdr.sh_entsize = sizeof(Dyn);
     if (insert_shdr(shdr) == SHN_UNDEF) {
       fputs("failed to insert new shdr for .dynamic", stderr);
     }
 
     shdr = {};
-    shdr.sh_name = shstrtab.GetOffset(".rela.dyn");
-    shdr.sh_type = SHT_RELA;
+    shdr.sh_name = shstrtab.GetOffset(T::rel_dyn_name);
+    shdr.sh_type = T::rel_shtype;
     shdr.sh_flags = SHF_ALLOC;
     shdr.sh_addr = dyn_info.rela;
     shdr.sh_offset = vaddr_to_foffset(shdr.sh_addr);
     shdr.sh_size = dyn_info.relasz;
     shdr.sh_link = dynsym_shndx;
-    shdr.sh_addralign = sizeof(u64);
-    shdr.sh_entsize = sizeof(Elf64_Rela);
+    shdr.sh_addralign = addr_size;
+    shdr.sh_entsize = sizeof(Reloc);
     if (insert_shdr(shdr) == SHN_UNDEF) {
-      fputs("failed to insert new shdr for .rela.dyn", stderr);
+      fputs("failed to insert new shdr for relocation section", stderr);
     }
 
     u32 plt_shndx = SHN_UNDEF;
@@ -1103,10 +1231,10 @@ struct NsoFile {
 
     if (present.got) {
       u64 glob_dat_end = got_addr;
-      for (size_t i = 0; i < dyn_info.relasz / sizeof(Elf64_Rela); i++) {
-        auto& rela = reinterpret_cast<Elf64_Rela*>(&image[dyn_info.rela])[i];
-        if (ELF64_R_TYPE(rela.r_info) == R_AARCH64_GLOB_DAT) {
-          glob_dat_end = std::max(glob_dat_end, rela.r_offset + sizeof(u64));
+      for (size_t i = 0; i < dyn_info.relasz / sizeof(Reloc); i++) {
+        auto& rel = reinterpret_cast<Reloc*>(&image[dyn_info.rela])[i];
+        if (T::R_TYPE(rel.r_info) == T::R_GLOB_DAT) {
+          glob_dat_end = std::max(glob_dat_end, (u64)rel.r_offset + addr_size);
         }
       }
       shdr = {};
@@ -1116,8 +1244,8 @@ struct NsoFile {
       shdr.sh_addr = got_addr;
       shdr.sh_offset = vaddr_to_foffset(shdr.sh_addr);
       shdr.sh_size = glob_dat_end - got_addr;
-      shdr.sh_addralign = sizeof(u64);
-      shdr.sh_entsize = sizeof(u64);
+      shdr.sh_addralign = addr_size;
+      shdr.sh_entsize = addr_size;
       if (insert_shdr(shdr, true) == SHN_UNDEF) {
         fputs("failed to insert new shdr for .got", stderr);
       }
@@ -1131,8 +1259,8 @@ struct NsoFile {
       shdr.sh_addr = dyn_info.pltgot;
       shdr.sh_offset = vaddr_to_foffset(shdr.sh_addr);
       shdr.sh_size = jump_slot_addr_end - dyn_info.pltgot;
-      shdr.sh_addralign = sizeof(u64);
-      shdr.sh_entsize = sizeof(u64);
+      shdr.sh_addralign = addr_size;
+      shdr.sh_entsize = addr_size;
       if (insert_shdr(shdr, true) == SHN_UNDEF) {
         fputs("failed to insert new shdr for .got.plt", stderr);
       }
@@ -1140,11 +1268,11 @@ struct NsoFile {
 
     if (present.rela_plt) {
       if (!present.plt) {
-        fputs("warning: .rela.plt with no .plt", stderr);
+        fputs("warning: .rel(a).plt with no .plt", stderr);
       }
       shdr = {};
-      shdr.sh_name = shstrtab.GetOffset(".rela.plt");
-      shdr.sh_type = SHT_RELA;
+      shdr.sh_name = shstrtab.GetOffset(T::rel_plt_name);
+      shdr.sh_type = T::rel_shtype;
       shdr.sh_flags = SHF_ALLOC;
       if (plt_shndx != SHN_UNDEF) {
         shdr.sh_flags |= SHF_INFO_LINK;
@@ -1154,10 +1282,10 @@ struct NsoFile {
       shdr.sh_size = dyn_info.pltrelsz;
       shdr.sh_link = dynsym_shndx;
       shdr.sh_info = plt_shndx;
-      shdr.sh_addralign = sizeof(u64);
-      shdr.sh_entsize = sizeof(Elf64_Rela);
+      shdr.sh_addralign = addr_size;
+      shdr.sh_entsize = sizeof(Reloc);
       if (insert_shdr(shdr) == SHN_UNDEF) {
-        fputs("failed to insert new shdr for .rela.plt", stderr);
+        fputs("failed to insert new shdr for relocation PLT section", stderr);
       }
     }
 
@@ -1169,7 +1297,7 @@ struct NsoFile {
       shdr.sh_addr = dyn_info.init_array;
       shdr.sh_offset = vaddr_to_foffset(shdr.sh_addr);
       shdr.sh_size = dyn_info.init_arraysz;
-      shdr.sh_addralign = sizeof(u64);
+      shdr.sh_addralign = addr_size;
       if (insert_shdr(shdr, true) == SHN_UNDEF) {
         fputs("failed to insert new shdr for .init_array", stderr);
       }
@@ -1183,7 +1311,7 @@ struct NsoFile {
       shdr.sh_addr = dyn_info.fini_array;
       shdr.sh_offset = vaddr_to_foffset(shdr.sh_addr);
       shdr.sh_size = dyn_info.fini_arraysz;
-      shdr.sh_addralign = sizeof(u64);
+      shdr.sh_addralign = addr_size;
       if (insert_shdr(shdr, true) == SHN_UNDEF) {
         fputs("failed to insert new shdr for .fini_array", stderr);
       }
@@ -1203,7 +1331,7 @@ struct NsoFile {
       shdr.sh_size = sizeof(*hash) + hash->nbucket * sizeof(u32) +
                      hash->nchain * sizeof(u32);
       shdr.sh_link = dynsym_shndx;
-      shdr.sh_addralign = sizeof(u64);
+      shdr.sh_addralign = addr_size;
       shdr.sh_entsize = sizeof(u32);
       if (insert_shdr(shdr) == SHN_UNDEF) {
         fputs("failed to insert new shdr for .hash", stderr);
@@ -1219,9 +1347,9 @@ struct NsoFile {
       }* gnu_hash =
           reinterpret_cast<decltype(gnu_hash)>(&image[dyn_info.gnu_hash]);
       size_t gnu_hash_len = sizeof(*gnu_hash);
-      gnu_hash_len += gnu_hash->maskwords * sizeof(u64);
+      gnu_hash_len += gnu_hash->maskwords * addr_size;
       gnu_hash_len += gnu_hash->nbuckets * sizeof(u32);
-      u64 dynsymcount = header.dynsym.size / sizeof(Elf64_Sym);
+      u64 dynsymcount = header.dynsym.size / sizeof(Sym);
       gnu_hash_len += (dynsymcount - gnu_hash->symndx) * sizeof(u32);
       shdr = {};
       shdr.sh_name = shstrtab.GetOffset(".gnu.hash");
@@ -1231,7 +1359,7 @@ struct NsoFile {
       shdr.sh_offset = vaddr_to_foffset(shdr.sh_addr);
       shdr.sh_size = gnu_hash_len;
       shdr.sh_link = dynsym_shndx;
-      shdr.sh_addralign = sizeof(u64);
+      shdr.sh_addralign = addr_size;
       shdr.sh_entsize = sizeof(u32);
       if (insert_shdr(shdr) == SHN_UNDEF) {
         fputs("failed to insert new shdr for .gnu.hash", stderr);
@@ -1364,6 +1492,11 @@ struct NsoFile {
   std::vector<u8> image;
   const Elf64_Dyn* dynamic{};
   const Elf64_Nhdr* note{};
+
+  bool is_64bit{true};
+  std::vector<Elf64_Dyn> dynamic_widened;
+  u32 dynamic_offset{};
+  u32 dynamic_count{};
 
   struct {
     u64 symtab;
