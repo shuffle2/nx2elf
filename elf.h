@@ -50,6 +50,7 @@ struct Elf64_Ehdr {
 #define ET_LOPROC 0xff00
 #define ET_HIPROC 0xffff
 
+#define EM_ARM 40
 #define EM_AARCH64 183
 
 struct Elf64_Phdr {
@@ -279,4 +280,79 @@ struct GnuBuildId {
     md5_digest build_id_md5;
     sha1_digest build_id_sha1;
   };
+};
+
+// ---- 32-bit ELF structures ----
+
+struct Elf32_Ehdr {
+  ElfIdent e_ident;
+  u16 e_type;
+  u16 e_machine;
+  u32 e_version;
+  u32 e_entry;
+  u32 e_phoff;
+  u32 e_shoff;
+  u32 e_flags;
+  u16 e_ehsize;
+  u16 e_phentsize;
+  u16 e_phnum;
+  u16 e_shentsize;
+  u16 e_shnum;
+  u16 e_shstrndx;
+};
+
+struct Elf32_Phdr {
+  u32 p_type;
+  u32 p_offset;
+  u32 p_vaddr;
+  u32 p_paddr;
+  u32 p_filesz;
+  u32 p_memsz;
+  u32 p_flags;
+  u32 p_align;
+};
+
+struct Elf32_Shdr {
+  u32 sh_name;
+  u32 sh_type;
+  u32 sh_flags;
+  u32 sh_addr;
+  u32 sh_offset;
+  u32 sh_size;
+  u32 sh_link;
+  u32 sh_info;
+  u32 sh_addralign;
+  u32 sh_entsize;
+};
+
+struct Elf32_Sym {
+  u32 st_name;
+  u32 st_value;
+  u32 st_size;
+  u8 st_info;
+  u8 st_other;
+  u16 st_shndx;
+};
+
+#define ELF32_ST_BIND(info) ((info) >> 4)
+#define ELF32_ST_TYPE(info) ((info)&0xf)
+
+struct Elf32_Rel {
+  u32 r_offset;
+  u32 r_info;
+};
+
+#define ELF32_R_SYM(i) ((i) >> 8)
+#define ELF32_R_TYPE(i) u8(i)
+
+/* ARM dynamic relocations */
+#define R_ARM_GLOB_DAT 21
+#define R_ARM_JUMP_SLOT 22
+#define R_ARM_RELATIVE 23
+
+#define EF_ARM_ABI_VER5 0x05000000
+
+struct Elf32_Dyn {
+  u32 d_tag;
+  u32 d_un;
 };
